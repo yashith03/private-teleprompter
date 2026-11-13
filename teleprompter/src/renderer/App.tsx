@@ -14,16 +14,29 @@ import {
   parseSlides,
   type SlideProgressState
 } from '../shared/slides';
-import type { Settings, ShortcutAction, ShortcutBindingStatus } from '../shared/types';
+import {
+  AI_PROVIDER_PRESETS,
+  type AiConfigPatch,
+  type AiProviderId,
+  type AiPublicConfig,
+  type Settings,
+  type ShortcutAction,
+  type ShortcutBindingStatus,
+  type SttConfig,
+  type SttStatus
+} from '../shared/types';
 import {
   CheckIcon, CloseIcon, EditIcon, MinimizeIcon, PauseIcon, PlayIcon, RestartIcon, SettingsIcon, ShieldIcon
 } from './icons';
+import { QaPanel } from './QaPanel';
 
 export const STEP_PX = 80;
 type Patch = Partial<Omit<Settings, 'privateNotes'>>;
+type TopTab = 'script' | 'qa';
 
 export function App() {
   const [s, setS] = useState<Settings | null>(null);
+  const [activeTab, setActiveTab] = useState<TopTab>('script');
   const [running, setRunning] = useState(false);
   const [editing, setEditing] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -40,6 +53,7 @@ export function App() {
   const speedRef = useRef(60);
   const runningRef = useRef(false);
   const editingRef = useRef(false);
+  const activeTabRef = useRef<TopTab>('script');
   const saveTimer = useRef<number | undefined>(undefined);
   const pending = useRef<Patch>({});
   const [scrubbing, setScrubbing] = useState(false);
@@ -53,17 +67,35 @@ export function App() {
   const [progress, setProgress] = useState<SlideProgressState>({ activeIndex: -1, fills: [] });
   const [privacyError, setPrivacyError] = useState<string | null>(null);
   const [privacyPending, setPrivacyPending] = useState(false);
+  const [aiConfig, setAiConfig] = useState<AiPublicConfig | null>(null);
+  const [aiKeyDraft, setAiKeyDraft] = useState('');
+  const [aiListedModels, setAiListedModels] = useState<string[]>([]);
+  const [aiStatus, setAiStatus] = useState<{ ok: boolean; text: string } | null>(null);
+  const [aiBusy, setAiBusy] = useState(false);
+  const [sttConfig, setSttConfig] = useState<SttConfig | null>(null);
+  const [sttStatus, setSttStatus] = useState<SttStatus | null>(null);
 
   const parsedSlides = useMemo(() => parseSlides(s?.script ?? ''), [s?.script]);
 
   useEffect(() => {
     void window.teleprompter.getSettings().then(setS);
+    void window.teleprompter.getAiConfig().then(setAiConfig);
+    void window.teleprompter.getSttConfig().then(setSttConfig);
+    void window.teleprompter.getSttStatus().then(setSttStatus);
     void window.teleprompter.getShortcuts().then(setShortcuts);
     return window.teleprompter.onShortcutStatus(setShortcuts);
+  }, []);
+
+  const onSttConfigChange = useCallback(async (patch: Partial<SttConfig>) => {
+    const updated = await window.teleprompter.updateSttConfig(patch);
+    setSttConfig(updated);
+    const status = await window.teleprompter.getSttStatus();
+    setSttStatus(status);
   }, []);
   useEffect(() => { if (s) speedRef.current = s.speed; }, [s?.speed]);
   useEffect(() => { runningRef.current = running; }, [running]);
   useEffect(() => { editingRef.current = editing; }, [editing]);
+  useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
 
   // Debounced local save of everything except privateNotes (which has its own channel).
   // Pending patches are merged so rapid changes of different fields are not lost.
@@ -112,6 +144,7 @@ export function App() {
       commitProgress({ activeIndex: -1, fills: [] });
       return;
     }
+    if (el.clientHeight === 0) return;
 
     const cs = getComputedStyle(el);
     const padTop = Number.parseFloat(cs.paddingTop) || 0;
@@ -150,9 +183,12 @@ export function App() {
   }, [parsedSlides.sections.length, commitProgress]);
 
   useLayoutEffect(() => {
-    if (!s || editing) return;
+    if (!s || editing || activeTab !== 'script') return;
+    if (readerRef.current) {
+      readerRef.current.scrollTop = posRef.current;
+    }
     measureAndSyncProgress();
-  }, [s?.script, s?.fontSize, editing, parsedSlides.sections.length, measureAndSyncProgress]);
+  }, [s?.script, s?.fontSize, editing, activeTab, parsedSlides.sections.length, measureAndSyncProgress]);
 
   useEffect(() => {
     if (!s || editing) return;
@@ -347,14 +383,18 @@ export function App() {
 
   useEffect(() => {
     return window.teleprompter.onShortcutAction((action: ShortcutAction) => {
+      const active = document.activeElement as HTMLElement | null;
+      if (active && (['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName) || active.isContentEditable)) {
+        return;
+      }
       if (action === 'toggle-scroll') toggleRun();
       else if (action === 'step-up') stepScroll(-STEP_PX);
       else if (action === 'step-down') stepScroll(STEP_PX);
     });
   }, [toggleRun, stepScroll]);
 
-  // Space toggles scrolling, except while a control, modifier key, or editor is active
-  // (so Ctrl+Space never double-triggers and focused buttons/editor behave normally).
+  // Space toggles scrolling, except while a control, modifier key, non-script tab, or editor is active
+  // (so Ctrl+Space never double-triggers and focused buttons/editor/chat input behave normally).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -364,9 +404,12 @@ export function App() {
         });
         return;
       }
-      if (e.code !== 'Space' || e.repeat || e.ctrlKey || e.altKey || e.metaKey || e.shiftKey || editingRef.current) return;
+      if (
+        e.code !== 'Space' || e.repeat || e.ctrlKey || e.altKey || e.metaKey || e.shiftKey ||
+        editingRef.current || activeTabRef.current !== 'script'
+      ) return;
       const t = e.target as HTMLElement | null;
-      if (t && ['BUTTON', 'INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName)) return;
+      if (t && (['BUTTON', 'INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName) || t.isContentEditable)) return;
       e.preventDefault();
       toggleRun();
     };
@@ -417,6 +460,86 @@ export function App() {
     }
   }, [s, privacyPending]);
 
+  const onAiConfigChange = useCallback(async (patch: AiConfigPatch) => {
+    const next = await window.teleprompter.updateAiConfig(patch);
+    setAiConfig(next);
+    if (patch.provider !== undefined) {
+      setAiListedModels([]);
+      setAiKeyDraft('');
+      setAiStatus(null);
+    }
+  }, []);
+
+  const onSaveAiKey = useCallback(async () => {
+    if (!aiConfig || aiBusy) return;
+    setAiBusy(true);
+    setAiStatus(null);
+    try {
+      const next = await window.teleprompter.setAiApiKey(aiConfig.provider, aiKeyDraft);
+      setAiConfig(next);
+      setAiKeyDraft('');
+      setAiStatus({
+        ok: true,
+        text: next.hasKey[next.provider]
+          ? next.encryptionAvailable
+            ? 'API key saved (OS-encrypted).'
+            : 'API key stored in memory for this session.'
+          : 'API key cleared.'
+      });
+    } catch (err) {
+      setAiStatus({ ok: false, text: err instanceof Error ? err.message : 'Failed to save API key.' });
+    } finally {
+      setAiBusy(false);
+    }
+  }, [aiConfig, aiKeyDraft, aiBusy]);
+
+  const onClearAiKey = useCallback(async () => {
+    if (!aiConfig || aiBusy) return;
+    setAiBusy(true);
+    setAiStatus(null);
+    try {
+      const next = await window.teleprompter.clearAiApiKey(aiConfig.provider);
+      setAiConfig(next);
+      setAiKeyDraft('');
+      setAiStatus({ ok: true, text: 'API key cleared.' });
+    } finally {
+      setAiBusy(false);
+    }
+  }, [aiConfig, aiBusy]);
+
+  const onListAiModels = useCallback(async () => {
+    if (aiBusy) return;
+    setAiBusy(true);
+    setAiStatus(null);
+    try {
+      const res = await window.teleprompter.listAiModels();
+      if (res.ok) {
+        setAiListedModels(res.models);
+        setAiStatus({ ok: true, text: `Loaded ${res.models.length} model(s).` });
+      } else {
+        setAiStatus({ ok: false, text: res.error || 'Could not list models.' });
+      }
+    } finally {
+      setAiBusy(false);
+    }
+  }, [aiBusy]);
+
+  const onTestAiConnection = useCallback(async () => {
+    if (aiBusy) return;
+    setAiBusy(true);
+    setAiStatus(null);
+    try {
+      const res = await window.teleprompter.testAiConnection();
+      if (res.ok) {
+        setAiStatus({ ok: true, text: `Connected (${res.latencyMs ?? 0}ms): ${res.replyPreview ?? 'OK'}` });
+      } else {
+        setAiStatus({ ok: false, text: res.error || 'Connection failed.' });
+      }
+    } finally {
+      setAiBusy(false);
+    }
+  }, [aiBusy]);
+
   if (!s) return <div className="loading">Loading...</div>;
 
   const restart = () => {
@@ -458,6 +581,33 @@ export function App() {
             <ShieldIcon on={s.privateNotes} />
             <span data-testid="privacy-badge">Private notes: {s.privateNotes ? 'ON' : 'OFF'}</span>
           </div>
+          <div className="tabs" role="tablist" aria-label="View">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === 'script'}
+              data-testid="tab-script"
+              className={`tab-btn ${activeTab === 'script' ? 'active' : ''}`}
+              onClick={() => setActiveTab('script')}
+            >
+              Script
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === 'qa'}
+              data-testid="tab-qa"
+              className={`tab-btn ${activeTab === 'qa' ? 'active' : ''}`}
+              onClick={() => {
+                if (activeTab === 'script' && readerRef.current) {
+                  posRef.current = readerRef.current.scrollTop;
+                }
+                setActiveTab('qa');
+              }}
+            >
+              AI Q&amp;A
+            </button>
+          </div>
           <span className="spacer" />
           <button
             type="button"
@@ -481,6 +631,7 @@ export function App() {
           </button>
         </header>
 
+        <div className="tab-panel" data-testid="script-panel" hidden={activeTab !== 'script'}>
         {!editing && (
           <div className="slide-bar-wrap" data-testid="slide-bar-wrap">
             {parsedSlides.sections.length > 0 ? (
@@ -669,6 +820,19 @@ export function App() {
             <SettingsIcon />
           </button>
         </footer>
+        </div>
+
+        <div className="tab-panel" data-testid="qa-panel-wrap" hidden={activeTab !== 'qa'}>
+          <QaPanel
+            aiConfig={aiConfig}
+            currentScript={s.script}
+            isQaTabActive={activeTab === 'qa'}
+            sttConfig={sttConfig}
+            sttStatus={sttStatus}
+            onSttConfigChange={onSttConfigChange}
+            onOpenSettings={() => setSettingsOpen(true)}
+          />
+        </div>
 
         <div
           ref={popoverRef}
@@ -743,6 +907,191 @@ export function App() {
               </div>
             ))}
           </div>
+          {aiConfig && (
+            <div className="ai-settings" data-testid="ai-settings" aria-label="AI Provider">
+              <div className="shortcuts-title">AI Provider</div>
+              <label className="row">
+                <span>Provider</span>
+                <select
+                  className="ai-select"
+                  data-testid="ai-provider"
+                  aria-label="AI Provider"
+                  value={aiConfig.provider}
+                  onChange={(e) => void onAiConfigChange({ provider: e.target.value as AiProviderId })}
+                >
+                  {(Object.keys(AI_PROVIDER_PRESETS) as AiProviderId[]).map((id) => (
+                    <option key={id} value={id}>{AI_PROVIDER_PRESETS[id].label}</option>
+                  ))}
+                </select>
+              </label>
+              {aiConfig.provider === 'custom' && (
+                <label className="ai-field">
+                  <span>Endpoint URL</span>
+                  <input
+                    type="url"
+                    className="ai-text-input"
+                    data-testid="ai-custom-url"
+                    aria-label="Custom OpenAI-compatible endpoint URL"
+                    placeholder="https://api.example.com/v1"
+                    value={aiConfig.customBaseUrl}
+                    onChange={(e) => void onAiConfigChange({ customBaseUrl: e.target.value })}
+                  />
+                </label>
+              )}
+              <div className="ai-field">
+                <div className="ai-field-row">
+                  <span>Model</span>
+                  <button
+                    type="button"
+                    className="ai-mini-btn"
+                    data-testid="ai-list-models"
+                    disabled={aiBusy}
+                    onClick={() => void onListAiModels()}
+                  >
+                    List
+                  </button>
+                </div>
+                <select
+                  className="ai-select full"
+                  data-testid="ai-model-select"
+                  aria-label="Select model"
+                  value={aiConfig.model}
+                  onChange={(e) => void onAiConfigChange({ model: e.target.value })}
+                >
+                  {Array.from(
+                    new Set([
+                      ...AI_PROVIDER_PRESETS[aiConfig.provider].suggestedModels,
+                      ...aiListedModels,
+                      ...(aiConfig.model ? [aiConfig.model] : [])
+                    ])
+                  ).map((m) => (
+                    <option key={m} value={m}>{m}</option>
+                  ))}
+                  {AI_PROVIDER_PRESETS[aiConfig.provider].suggestedModels.length === 0 &&
+                    aiListedModels.length === 0 &&
+                    !aiConfig.model && <option value="">Enter model ID below</option>}
+                </select>
+                <input
+                  type="text"
+                  className="ai-text-input"
+                  data-testid="ai-model-input"
+                  aria-label="Manual Model ID"
+                  placeholder="Manual Model ID"
+                  value={aiConfig.model}
+                  onChange={(e) => void onAiConfigChange({ model: e.target.value })}
+                />
+              </div>
+              <div className="ai-field">
+                <span>API Key</span>
+                <div className="ai-key-row">
+                  <input
+                    type="password"
+                    className="ai-text-input"
+                    data-testid="ai-key-input"
+                    aria-label="API Key"
+                    placeholder={aiConfig.hasKey[aiConfig.provider] ? 'Saved (encrypted)' : 'Enter API key...'}
+                    value={aiKeyDraft}
+                    onChange={(e) => setAiKeyDraft(e.target.value)}
+                  />
+                  <button
+                    type="button"
+                    className="ai-mini-btn"
+                    data-testid="ai-key-save"
+                    disabled={aiBusy || !aiKeyDraft.trim()}
+                    onClick={() => void onSaveAiKey()}
+                  >
+                    Save
+                  </button>
+                  {aiConfig.hasKey[aiConfig.provider] && (
+                    <button
+                      type="button"
+                      className="ai-mini-btn"
+                      data-testid="ai-key-clear"
+                      disabled={aiBusy}
+                      onClick={() => void onClearAiKey()}
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+              </div>
+              <button
+                type="button"
+                className="btn-secondary"
+                data-testid="ai-test-connection"
+                disabled={aiBusy}
+                onClick={() => void onTestAiConnection()}
+              >
+                Test Connection
+              </button>
+              {aiStatus && (
+                <div
+                  className={`ai-test-status ${aiStatus.ok ? 'ok' : 'err'}`}
+                  data-testid="ai-test-status"
+                  role="status"
+                >
+                  {aiStatus.text}
+                </div>
+              )}
+            </div>
+          )}
+          {sttConfig && (
+            <div className="settings-ai-section" data-testid="stt-settings">
+              <div className="settings-ai-title">Voice / Whisper (Local)</div>
+              <div className="row">
+                <span>Auto-listen in AI Q&amp;A</span>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={sttConfig.autoListen}
+                  data-testid="stt-autolisten-toggle"
+                  className={`switch ${sttConfig.autoListen ? 'on' : ''}`}
+                  onClick={() => void onSttConfigChange({ autoListen: !sttConfig.autoListen })}
+                />
+              </div>
+              <div className="ai-field">
+                <span>Language</span>
+                <input
+                  type="text"
+                  className="ai-text-input"
+                  data-testid="stt-language"
+                  aria-label="Whisper language"
+                  placeholder="en"
+                  value={sttConfig.language}
+                  onChange={(e) => void onSttConfigChange({ language: e.target.value })}
+                />
+              </div>
+              <div className="ai-field">
+                <span>Whisper Model (.bin)</span>
+                <input
+                  type="text"
+                  className="ai-text-input"
+                  data-testid="stt-model-path"
+                  aria-label="Whisper model path"
+                  placeholder="Path to ggml-*.bin"
+                  value={sttConfig.modelPath}
+                  onChange={(e) => void onSttConfigChange({ modelPath: e.target.value })}
+                />
+              </div>
+              <div className="ai-field">
+                <span>whisper.cpp Binary</span>
+                <input
+                  type="text"
+                  className="ai-text-input"
+                  data-testid="stt-binary-path"
+                  aria-label="whisper.cpp binary path"
+                  placeholder="Path to whisper-cli.exe"
+                  value={sttConfig.binaryPath}
+                  onChange={(e) => void onSttConfigChange({ binaryPath: e.target.value })}
+                />
+              </div>
+              {sttStatus && !sttStatus.available && sttStatus.reason && (
+                <div className="ai-test-status err" data-testid="stt-status-reason">
+                  {sttStatus.reason}
+                </div>
+              )}
+            </div>
+          )}
           <button
             type="button"
             data-testid="reopen"
