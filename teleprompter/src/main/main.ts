@@ -1,9 +1,23 @@
 import { app, BrowserWindow, globalShortcut, ipcMain, screen, type IpcMainInvokeEvent } from 'electron';
 import path from 'node:path';
 import { SettingsStore } from './settingsStore';
-import type { Settings, ShortcutAction, ShortcutBindingStatus } from '../shared/types';
+import type {
+  AiChatStreamEvent,
+  AiConfigPatch,
+  AiProviderId,
+  AiSendMessageInput,
+  QaKnowledgePatch,
+  Settings,
+  ShortcutAction,
+  ShortcutBindingStatus,
+  SttConfig
+} from '../shared/types';
 import { runSelfTest } from './selftest';
 import { applyWindowsTaskbarPreviewProtection } from './windowsPreview';
+import { AiSecretStore } from './aiSecretStore';
+import { AiProviderService } from './aiProvider';
+import { QaKnowledgeStore } from './qaKnowledge';
+import { WhisperSttService } from './whisperStt';
 
 const SELFTEST = process.env.TELEPROMPTER_SELFTEST === '1';
 if (SELFTEST) {
@@ -15,6 +29,10 @@ const gotLock = SELFTEST || app.requestSingleInstanceLock();
 if (!gotLock) app.quit();
 
 let store: SettingsStore;
+let aiStore: AiSecretStore;
+let qaStore: QaKnowledgeStore;
+let sttService: WhisperSttService;
+const aiProvider = new AiProviderService();
 let overlay: BrowserWindow | null = null;
 /** Ordered log of main-process window events, used by the self-test. */
 export const eventLog: string[] = [];
@@ -139,6 +157,7 @@ export function createOverlay(): BrowserWindow {
     // Show taskbar entry when minimized so user can restore it
     win.setSkipTaskbar(false);
     applyWindowsTaskbarPreviewProtection(win);
+    win.webContents.send('window:minimized');
     eventLog.push('minimize-event');
   });
   win.on('restore', () => {
@@ -222,6 +241,118 @@ function registerIpc(): void {
     return shortcutStatus;
   });
 
+  ipcMain.handle('ai:get-config', (e) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    return aiStore.getPublicConfig();
+  });
+
+  ipcMain.handle('ai:update-config', (e, patch: AiConfigPatch) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    const safe: AiConfigPatch = {};
+    if (patch && typeof patch === 'object') {
+      if (typeof patch.provider === 'string') safe.provider = patch.provider;
+      if (typeof patch.model === 'string') safe.model = patch.model;
+      if (typeof patch.customBaseUrl === 'string') safe.customBaseUrl = patch.customBaseUrl;
+    }
+    return aiStore.updateConfig(safe);
+  });
+
+  ipcMain.handle('ai:set-api-key', (e, provider: AiProviderId, apiKey: string) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    if (typeof provider !== 'string' || typeof apiKey !== 'string') {
+      throw new Error('Invalid AI key payload');
+    }
+    return aiStore.setApiKey(provider, apiKey);
+  });
+
+  ipcMain.handle('ai:clear-api-key', (e, provider: AiProviderId) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    if (typeof provider !== 'string') throw new Error('Invalid provider');
+    return aiStore.clearApiKey(provider);
+  });
+
+  ipcMain.handle('ai:list-models', async (e) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    return aiProvider.listModels(aiStore);
+  });
+
+  ipcMain.handle('ai:test-connection', async (e) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    return aiProvider.testConnection(aiStore);
+  });
+
+  ipcMain.handle('ai:send-message', (e, input: AiSendMessageInput) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    if (!input || typeof input.question !== 'string' || !input.question.trim()) {
+      throw new Error('Question is required');
+    }
+    const emit = (ev: AiChatStreamEvent) => {
+      if (overlay && !overlay.isDestroyed()) {
+        overlay.webContents.send('ai:stream-event', ev);
+      }
+    };
+    const requestId = aiProvider.startStream(aiStore, qaStore, input, {
+      onSources: (meta) => emit({ requestId, type: 'sources', ...meta }),
+      onDelta: (text) => emit({ requestId, type: 'delta', text }),
+      onDone: (refs) => emit({ requestId, type: 'done', ...(refs ?? {}) }),
+      onError: (errorKind, error) => emit({ requestId, type: 'error', errorKind, error }),
+      onCancelled: () => emit({ requestId, type: 'cancelled' })
+    });
+    return { requestId };
+  });
+
+  ipcMain.handle('qa:get-knowledge', (e) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    return qaStore.get();
+  });
+
+  ipcMain.handle('qa:update-knowledge', (e, patch: QaKnowledgePatch) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    const safe: QaKnowledgePatch = {};
+    if (patch && typeof patch === 'object') {
+      if (typeof patch.slideSpeech === 'string') safe.slideSpeech = patch.slideSpeech;
+      if (typeof patch.researchNotes === 'string') safe.researchNotes = patch.researchNotes;
+      if (Array.isArray(patch.approvedPairs)) safe.approvedPairs = patch.approvedPairs;
+    }
+    return qaStore.update(safe);
+  });
+
+  ipcMain.handle('stt:get-config', (e) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    return sttService.getConfig();
+  });
+
+  ipcMain.handle('stt:update-config', (e, patch: Partial<SttConfig>) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    const safe: Partial<SttConfig> = {};
+    if (patch && typeof patch === 'object') {
+      if (typeof patch.language === 'string') safe.language = patch.language;
+      if (typeof patch.modelPath === 'string') safe.modelPath = patch.modelPath;
+      if (typeof patch.binaryPath === 'string') safe.binaryPath = patch.binaryPath;
+      if (typeof patch.deviceId === 'string') safe.deviceId = patch.deviceId;
+      if (typeof patch.autoListen === 'boolean') safe.autoListen = patch.autoListen;
+      if (typeof patch.permissionGranted === 'boolean') safe.permissionGranted = patch.permissionGranted;
+      if (typeof patch.saveRawAudio === 'boolean') safe.saveRawAudio = patch.saveRawAudio;
+    }
+    return sttService.updateConfig(safe);
+  });
+
+  ipcMain.handle('stt:get-status', (e) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    return sttService.getStatus();
+  });
+
+  ipcMain.handle('stt:transcribe', async (e, pcm16kBase64: string, isFinal: boolean) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    if (typeof pcm16kBase64 !== 'string') throw new Error('Invalid audio payload');
+    return sttService.transcribePcm16k(pcm16kBase64, isFinal === true);
+  });
+
+  ipcMain.handle('ai:stop', (e, requestId?: string) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    aiProvider.stop(typeof requestId === 'string' ? requestId : undefined);
+  });
+
   // Fallback resize grip: native edge resizing of transparent frameless windows can be
   // unreliable on Windows, so the renderer's corner grip drives the size from here.
   ipcMain.on('window:resize', (e, width: number, height: number) => {
@@ -247,13 +378,18 @@ export function reopenOverlay(): BrowserWindow {
 
 app.whenReady().then(() => {
   if (!gotLock) return;
-  store = new SettingsStore(path.join(app.getPath('userData'), 'settings.json'));
+  const userDataDir = app.getPath('userData');
+  store = new SettingsStore(path.join(userDataDir, 'settings.json'));
+  aiStore = new AiSecretStore(userDataDir);
+  qaStore = new QaKnowledgeStore(userDataDir);
+  sttService = new WhisperSttService(userDataDir);
   registerIpc();
   const win = createOverlay();
   registerGlobalShortcuts();
   if (SELFTEST) {
     void runSelfTest({
       store,
+      sttService,
       getWindow: () => overlay ?? win,
       reopen: reopenOverlay,
       registerGlobalShortcuts,
@@ -269,7 +405,10 @@ app.on('second-instance', () => {
   overlay.focus();
 });
 
-app.on('before-quit', () => store?.flush());
+app.on('before-quit', () => {
+  aiProvider.stop();
+  store?.flush();
+});
 app.on('will-quit', () => globalShortcut.unregisterAll());
 app.on('window-all-closed', () => app.quit());
 
