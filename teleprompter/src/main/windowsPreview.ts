@@ -1,7 +1,25 @@
-import { BrowserWindow } from 'electron';
+import { app, BrowserWindow } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
+
+let shuttingDown = false;
+app.once('before-quit', () => {
+  shuttingDown = true;
+});
+
+function resolveHelperPaths(): { helperExe: string; logoPng: string } | null {
+  const winDir = app.isPackaged
+    ? path.join(process.resourcesPath, 'windows')
+    : path.join(__dirname, 'windows');
+  const helperExe = path.join(winDir, 'dwmHelper.exe');
+  const logoPng = path.join(winDir, 'logo.png');
+
+  if (helperExe.includes('app.asar') || !fs.existsSync(helperExe)) {
+    return null;
+  }
+  return { helperExe, logoPng };
+}
 
 /**
  * Configure Windows Desktop Window Manager (DWM) attributes on the BrowserWindow HWND:
@@ -12,43 +30,29 @@ import { spawn } from 'node:child_process';
  * 5. Sets the iconic thumbnail and live preview bitmap to the static app logo so no speech text is shown in hover previews.
  */
 export function applyWindowsTaskbarPreviewProtection(win: BrowserWindow): void {
-  if (process.platform !== 'win32' || win.isDestroyed()) return;
+  if (process.platform !== 'win32' || shuttingDown || win.isDestroyed()) return;
 
   try {
+    const resolved = resolveHelperPaths();
+    if (!resolved) return;
+
     const handle = win.getNativeWindowHandle();
     // HWND on Windows x64 is a 64-bit integer stored little-endian
     const hwnd = handle.length >= 8 ? handle.readBigInt64LE(0).toString() : handle.readInt32LE(0).toString();
 
-    // Look for dwmHelper.exe and logo.png in the app directory or unpack directory
-    const candidates = [
-      path.join(__dirname, 'windows'),
-      path.join(__dirname, '..', 'src', 'main', 'windows'),
-      path.join(process.resourcesPath || '', 'app.asar.unpacked', 'dist', 'main', 'windows'),
-      path.join(process.resourcesPath || '', 'app', 'dist', 'main', 'windows'),
-      path.join(__dirname)
-    ];
+    const args = [hwnd];
+    if (fs.existsSync(resolved.logoPng)) args.push(resolved.logoPng);
 
-    let helperExe: string | null = null;
-    let logoPng: string | null = null;
-
-    for (const dir of candidates) {
-      const exe = path.join(dir, 'dwmHelper.exe');
-      const logo = path.join(dir, 'logo.png');
-      if (!helperExe && fs.existsSync(exe)) helperExe = exe;
-      if (!logoPng && fs.existsSync(logo)) logoPng = logo;
-    }
-
-    if (helperExe) {
-      const args = [hwnd];
-      if (logoPng) args.push(logoPng);
-      const child = spawn(helperExe, args, {
-        windowsHide: true,
-        stdio: 'ignore',
-        detached: true
-      });
-      child.unref();
-    }
-  } catch (err) {
+    const child = spawn(resolved.helperExe, args, {
+      windowsHide: true,
+      stdio: 'ignore',
+      detached: true
+    });
+    child.on('error', () => {
+      // Swallow spawn errors so no Electron crash dialog appears.
+    });
+    child.unref();
+  } catch {
     // Non-fatal if DWM configuration cannot be run
   }
 }

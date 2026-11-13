@@ -33,12 +33,14 @@ run('main/preload build', 'node_modules/typescript/bin/tsc', ['-p', 'tsconfig.ma
 const distWin = path.join(root, 'dist', 'main', 'windows');
 const srcWin = path.join(root, 'src', 'main', 'windows');
 fs.mkdirSync(distWin, { recursive: true });
-if (fs.existsSync(path.join(srcWin, 'dwmHelper.exe'))) {
-  fs.copyFileSync(path.join(srcWin, 'dwmHelper.exe'), path.join(distWin, 'dwmHelper.exe'));
+const helperSrc = path.join(srcWin, 'dwmHelper.exe');
+const logoSrc = path.join(srcWin, 'logo.png');
+if (!fs.existsSync(helperSrc) || !fs.existsSync(logoSrc)) {
+  console.error('[package] missing dwmHelper.exe or logo.png in src/main/windows.');
+  process.exit(1);
 }
-if (fs.existsSync(path.join(srcWin, 'logo.png'))) {
-  fs.copyFileSync(path.join(srcWin, 'logo.png'), path.join(distWin, 'logo.png'));
-}
+fs.copyFileSync(helperSrc, path.join(distWin, 'dwmHelper.exe'));
+fs.copyFileSync(logoSrc, path.join(distWin, 'logo.png'));
 
 run('installer and zip', 'node_modules/electron-builder/cli.js', ['--win', 'nsis', 'zip', '--x64', '--publish', 'never']);
 

@@ -36,7 +36,13 @@
     "productName": "Private Teleprompter",
     "copyright": "Private Teleprompter",
     "directories": { "output": "release", "buildResources": "build" },
-    "files": ["dist/**/*", "package.json"],
+    "files": ["dist/**/*", "!dist/main/windows/**", "package.json"],
+    "extraResources": [
+      {
+        "from": "dist/main/windows",
+        "to": "windows"
+      }
+    ],
     "asar": true,
     "win": {
       "target": [

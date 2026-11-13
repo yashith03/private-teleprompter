@@ -134,12 +134,14 @@ export function createOverlay(): BrowserWindow {
     applyWindowsTaskbarPreviewProtection(win);
   });
   win.on('minimize', () => {
+    if (win.isDestroyed()) return;
     // Show taskbar entry when minimized so user can restore it
     win.setSkipTaskbar(false);
     applyWindowsTaskbarPreviewProtection(win);
     eventLog.push('minimize-event');
   });
   win.on('restore', () => {
+    if (win.isDestroyed()) return;
     // Hide taskbar entry on restore; restore same window and preserve settings
     win.setSkipTaskbar(true);
     win.setAlwaysOnTop(true, 'screen-saver');
