@@ -1,6 +1,6 @@
 {
   "name": "private-teleprompter",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Offline teleprompter overlay for Windows 11 with optional capture exclusion (Private notes).",
   "author": "Private Teleprompter",
   "main": "dist/main/main.js",

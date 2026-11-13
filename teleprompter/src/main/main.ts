@@ -95,6 +95,7 @@ export function createOverlay(): BrowserWindow {
   const height = saved?.height ?? 340;
 
   const win = new BrowserWindow({
+    title: 'Notch-Copy',
     width,
     height,
     x: saved?.x ?? Math.round(workArea.x + (workArea.width - width) / 2),
