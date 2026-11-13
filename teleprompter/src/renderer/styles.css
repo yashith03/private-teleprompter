@@ -512,3 +512,4 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   background: rgba(37, 99, 235, 0.18); border-color: rgba(96, 165, 250, 0.38); color: #e2e8f0;
 }
 .card.theme-dark .qa-mic-error { color: #fca5a5; }
+.qa-error-actions { display: flex; gap: 6px; margin-top: 6px; }

@@ -20,12 +20,15 @@ import { QaKnowledgeStore } from './qaKnowledge';
 import { WhisperSttService } from './whisperStt';
 
 const SELFTEST = process.env.TELEPROMPTER_SELFTEST === '1';
+const E2E_USER_DATA = process.env.TELEPROMPTER_E2E_USER_DATA;
 if (SELFTEST) {
   app.setPath('userData', path.join(app.getPath('temp'), `teleprompter-selftest-${Date.now()}`));
+} else if (E2E_USER_DATA) {
+  app.setPath('userData', E2E_USER_DATA);
 }
 
 // Single instance: a second double-click focuses the running overlay instead of opening another.
-const gotLock = SELFTEST || app.requestSingleInstanceLock();
+const gotLock = SELFTEST || Boolean(E2E_USER_DATA) || app.requestSingleInstanceLock();
 if (!gotLock) app.quit();
 
 let store: SettingsStore;
@@ -157,6 +160,7 @@ export function createOverlay(): BrowserWindow {
     // Show taskbar entry when minimized so user can restore it
     win.setSkipTaskbar(false);
     applyWindowsTaskbarPreviewProtection(win);
+    sttService.stopStream();
     win.webContents.send('window:minimized');
     eventLog.push('minimize-event');
   });
@@ -178,7 +182,10 @@ export function createOverlay(): BrowserWindow {
   };
   win.on('move', saveBounds);
   win.on('resize', saveBounds);
-  win.on('closed', () => { if (overlay === win) overlay = null; });
+  win.on('closed', () => {
+    sttService.stopStream();
+    if (overlay === win) overlay = null;
+  });
 
   const devUrl = process.env.VITE_DEV_URL;
   if (!app.isPackaged && devUrl) void win.loadURL(devUrl);
@@ -251,6 +258,7 @@ function registerIpc(): void {
     const safe: AiConfigPatch = {};
     if (patch && typeof patch === 'object') {
       if (typeof patch.provider === 'string') safe.provider = patch.provider;
+      if (patch.modelMode === 'auto' || patch.modelMode === 'manual') safe.modelMode = patch.modelMode;
       if (typeof patch.model === 'string') safe.model = patch.model;
       if (typeof patch.customBaseUrl === 'string') safe.customBaseUrl = patch.customBaseUrl;
     }
@@ -313,6 +321,7 @@ function registerIpc(): void {
       if (typeof patch.slideSpeech === 'string') safe.slideSpeech = patch.slideSpeech;
       if (typeof patch.researchNotes === 'string') safe.researchNotes = patch.researchNotes;
       if (Array.isArray(patch.approvedPairs)) safe.approvedPairs = patch.approvedPairs;
+      if (typeof patch.answerInstructions === 'string') safe.answerInstructions = patch.answerInstructions;
     }
     return qaStore.update(safe);
   });
@@ -326,6 +335,8 @@ function registerIpc(): void {
     if (!trusted(e)) throw new Error('untrusted sender');
     const safe: Partial<SttConfig> = {};
     if (patch && typeof patch === 'object') {
+      if (typeof patch.provider === 'string') safe.provider = patch.provider;
+      if (typeof patch.deepgramModel === 'string') safe.deepgramModel = patch.deepgramModel;
       if (typeof patch.language === 'string') safe.language = patch.language;
       if (typeof patch.modelPath === 'string') safe.modelPath = patch.modelPath;
       if (typeof patch.binaryPath === 'string') safe.binaryPath = patch.binaryPath;
@@ -337,6 +348,17 @@ function registerIpc(): void {
     return sttService.updateConfig(safe);
   });
 
+  ipcMain.handle('stt:set-deepgram-key', (e, apiKey: string) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    if (typeof apiKey !== 'string') throw new Error('Invalid Deepgram API key');
+    return sttService.setDeepgramApiKey(apiKey);
+  });
+
+  ipcMain.handle('stt:clear-deepgram-key', (e) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    return sttService.clearDeepgramApiKey();
+  });
+
   ipcMain.handle('stt:get-status', (e) => {
     if (!trusted(e)) throw new Error('untrusted sender');
     return sttService.getStatus();
@@ -346,6 +368,26 @@ function registerIpc(): void {
     if (!trusted(e)) throw new Error('untrusted sender');
     if (typeof pcm16kBase64 !== 'string') throw new Error('Invalid audio payload');
     return sttService.transcribePcm16k(pcm16kBase64, isFinal === true);
+  });
+
+  ipcMain.handle('stt:stream-start', (e) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    return sttService.startStream((ev) => {
+      if (overlay && !overlay.isDestroyed()) {
+        overlay.webContents.send('stt:stream-event', ev);
+      }
+    });
+  });
+
+  ipcMain.on('stt:stream-audio', (e, sessionId: string, pcm16kBase64: string) => {
+    if (!overlay || overlay.isDestroyed() || e.sender !== overlay.webContents) return;
+    if (typeof sessionId !== 'string' || typeof pcm16kBase64 !== 'string') return;
+    sttService.sendStreamAudio(sessionId, pcm16kBase64);
+  });
+
+  ipcMain.handle('stt:stream-stop', (e, sessionId?: string) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    sttService.stopStream(typeof sessionId === 'string' ? sessionId : undefined);
   });
 
   ipcMain.handle('ai:stop', (e, requestId?: string) => {
@@ -407,6 +449,7 @@ app.on('second-instance', () => {
 
 app.on('before-quit', () => {
   aiProvider.stop();
+  sttService?.stopStream();
   store?.flush();
 });
 app.on('will-quit', () => globalShortcut.unregisterAll());

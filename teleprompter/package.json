@@ -13,10 +13,12 @@
     "start": "npm run build && electron .",
     "dev": "concurrently -k \"vite\" \"wait-on tcp:5173 && npm run build:main && cross-env VITE_DEV_URL=http://localhost:5173 electron .\"",
     "selftest": "npm run build && cross-env TELEPROMPTER_SELFTEST=1 electron .",
+    "test:e2e": "npm run build && playwright test",
     "icon": "node scripts/make-icon.mjs",
     "dist": "node scripts/package.mjs"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.0",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
@@ -35,8 +37,15 @@
     "appId": "com.privateteleprompter.app",
     "productName": "Private Teleprompter",
     "copyright": "Private Teleprompter",
-    "directories": { "output": "release", "buildResources": "build" },
-    "files": ["dist/**/*", "!dist/main/windows/**", "package.json"],
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "!dist/main/windows/**",
+      "package.json"
+    ],
     "extraResources": [
       {
         "from": "dist/main/windows",
@@ -46,8 +55,18 @@
     "asar": true,
     "win": {
       "target": [
-        { "target": "nsis", "arch": ["x64"] },
-        { "target": "zip", "arch": ["x64"] }
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64"
+          ]
+        }
       ],
       "icon": "build/icon.ico",
       "artifactName": "${productName}-${version}-${os}-${arch}.${ext}"

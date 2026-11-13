@@ -8,6 +8,7 @@ import type {
   ShortcutAction,
   ShortcutBindingStatus,
   SttConfig,
+  SttStreamEvent,
   TeleprompterApi
 } from '../shared/types';
 
@@ -70,9 +71,28 @@ const api: TeleprompterApi = {
   updateQaKnowledge: (patch: QaKnowledgePatch) => ipcRenderer.invoke('qa:update-knowledge', patch),
   getSttConfig: () => ipcRenderer.invoke('stt:get-config'),
   updateSttConfig: (patch: Partial<SttConfig>) => ipcRenderer.invoke('stt:update-config', patch),
+  setDeepgramApiKey: (apiKey: string) =>
+    ipcRenderer.invoke('stt:set-deepgram-key', typeof apiKey === 'string' ? apiKey : ''),
+  clearDeepgramApiKey: () => ipcRenderer.invoke('stt:clear-deepgram-key'),
   getSttStatus: () => ipcRenderer.invoke('stt:get-status'),
   transcribeAudio: (pcm16kBase64: string, isFinal: boolean) =>
     ipcRenderer.invoke('stt:transcribe', typeof pcm16kBase64 === 'string' ? pcm16kBase64 : '', isFinal === true),
+  startSttStream: () => ipcRenderer.invoke('stt:stream-start'),
+  sendSttAudio: (sessionId: string, pcm16kBase64: string) => {
+    if (typeof sessionId === 'string' && typeof pcm16kBase64 === 'string') {
+      ipcRenderer.send('stt:stream-audio', sessionId, pcm16kBase64);
+    }
+  },
+  stopSttStream: (sessionId?: string) => ipcRenderer.invoke('stt:stream-stop', sessionId),
+  onSttEvent: (cb) => {
+    const handler = (_e: IpcRendererEvent, ev: unknown) => {
+      if (ev && typeof ev === 'object' && 'sessionId' in ev && 'type' in ev) {
+        cb(ev as SttStreamEvent);
+      }
+    };
+    ipcRenderer.on('stt:stream-event', handler);
+    return () => ipcRenderer.removeListener('stt:stream-event', handler);
+  },
   onWindowMinimized: (cb) => {
     const handler = () => cb();
     ipcRenderer.on('window:minimized', handler);

@@ -17,12 +17,15 @@ import {
 import {
   AI_PROVIDER_PRESETS,
   type AiConfigPatch,
+  type AiModelListResult,
   type AiProviderId,
   type AiPublicConfig,
+  type DeepgramModelId,
   type Settings,
   type ShortcutAction,
   type ShortcutBindingStatus,
   type SttConfig,
+  type SttProviderId,
   type SttStatus
 } from '../shared/types';
 import {
@@ -69,26 +72,100 @@ export function App() {
   const [privacyPending, setPrivacyPending] = useState(false);
   const [aiConfig, setAiConfig] = useState<AiPublicConfig | null>(null);
   const [aiKeyDraft, setAiKeyDraft] = useState('');
-  const [aiListedModels, setAiListedModels] = useState<string[]>([]);
+  const [aiDiscovery, setAiDiscovery] = useState<AiModelListResult | null>(null);
+  const [aiDiscoveryLoading, setAiDiscoveryLoading] = useState(false);
   const [aiStatus, setAiStatus] = useState<{ ok: boolean; text: string } | null>(null);
   const [aiBusy, setAiBusy] = useState(false);
+  const [manualModelMode, setManualModelMode] = useState(false);
+  const aiDiscoverySeqRef = useRef(0);
+  const aiActiveSelectionRef = useRef<{ provider: AiProviderId; customBaseUrl: string }>({
+    provider: 'gemini',
+    customBaseUrl: ''
+  });
+  const aiUrlDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [sttConfig, setSttConfig] = useState<SttConfig | null>(null);
   const [sttStatus, setSttStatus] = useState<SttStatus | null>(null);
+  const [deepgramKeyDraft, setDeepgramKeyDraft] = useState('');
 
   const parsedSlides = useMemo(() => parseSlides(s?.script ?? ''), [s?.script]);
 
+  const refreshAiModels = useCallback(async (target?: AiPublicConfig, showStatus = false) => {
+    const seq = ++aiDiscoverySeqRef.current;
+    const expectedProvider = target?.provider ?? aiActiveSelectionRef.current.provider;
+    const expectedCustomUrl = (target?.customBaseUrl ?? aiActiveSelectionRef.current.customBaseUrl).trim();
+    setAiDiscoveryLoading(true);
+    try {
+      const res = await window.teleprompter.listAiModels();
+      if (seq !== aiDiscoverySeqRef.current) return;
+      if (
+        res.provider !== aiActiveSelectionRef.current.provider ||
+        (res.provider === 'custom' &&
+          expectedProvider === 'custom' &&
+          expectedCustomUrl &&
+          aiActiveSelectionRef.current.customBaseUrl.trim() !== expectedCustomUrl)
+      ) {
+        return;
+      }
+      setAiDiscovery(res);
+      if (showStatus) {
+        if (res.ok) {
+          const chatCount = res.models.filter((m) => m.capability === 'chat').length;
+          setAiStatus({ ok: true, text: `Discovered ${chatCount} chat model(s).` });
+        } else {
+          setAiStatus({
+            ok: false,
+            text: res.cached
+              ? `Using cached models (${res.error || 'refresh failed'}).`
+              : res.error || 'Could not list models.'
+          });
+        }
+      }
+    } finally {
+      if (seq === aiDiscoverySeqRef.current) {
+        setAiDiscoveryLoading(false);
+      }
+    }
+  }, []);
+
   useEffect(() => {
     void window.teleprompter.getSettings().then(setS);
-    void window.teleprompter.getAiConfig().then(setAiConfig);
+    void window.teleprompter.getAiConfig().then((cfg) => {
+      setAiConfig(cfg);
+      aiActiveSelectionRef.current = {
+        provider: cfg.provider,
+        customBaseUrl: cfg.customBaseUrl.trim()
+      };
+      if (cfg.hasKey[cfg.provider] || (cfg.provider === 'custom' && cfg.customBaseUrl.trim())) {
+        void refreshAiModels(cfg, false);
+      }
+    });
     void window.teleprompter.getSttConfig().then(setSttConfig);
     void window.teleprompter.getSttStatus().then(setSttStatus);
     void window.teleprompter.getShortcuts().then(setShortcuts);
     return window.teleprompter.onShortcutStatus(setShortcuts);
-  }, []);
+  }, [refreshAiModels]);
 
   const onSttConfigChange = useCallback(async (patch: Partial<SttConfig>) => {
     const updated = await window.teleprompter.updateSttConfig(patch);
     setSttConfig(updated);
+    const status = await window.teleprompter.getSttStatus();
+    setSttStatus(status);
+  }, []);
+
+  const onSaveDeepgramKey = useCallback(async () => {
+    const trimmed = deepgramKeyDraft.trim();
+    if (!trimmed) return;
+    const updated = await window.teleprompter.setDeepgramApiKey(trimmed);
+    setSttConfig(updated);
+    setDeepgramKeyDraft('');
+    const status = await window.teleprompter.getSttStatus();
+    setSttStatus(status);
+  }, [deepgramKeyDraft]);
+
+  const onClearDeepgramKey = useCallback(async () => {
+    const updated = await window.teleprompter.clearDeepgramApiKey();
+    setSttConfig(updated);
+    setDeepgramKeyDraft('');
     const status = await window.teleprompter.getSttStatus();
     setSttStatus(status);
   }, []);
@@ -463,12 +540,31 @@ export function App() {
   const onAiConfigChange = useCallback(async (patch: AiConfigPatch) => {
     const next = await window.teleprompter.updateAiConfig(patch);
     setAiConfig(next);
+    aiActiveSelectionRef.current = {
+      provider: next.provider,
+      customBaseUrl: next.customBaseUrl.trim()
+    };
     if (patch.provider !== undefined) {
-      setAiListedModels([]);
+      aiDiscoverySeqRef.current += 1;
+      setAiDiscovery(null);
+      setAiDiscoveryLoading(false);
       setAiKeyDraft('');
       setAiStatus(null);
+      setManualModelMode(false);
+      if (next.hasKey[next.provider] || (next.provider === 'custom' && next.customBaseUrl.trim())) {
+        void refreshAiModels(next, false);
+      }
+    } else if (patch.customBaseUrl !== undefined) {
+      aiDiscoverySeqRef.current += 1;
+      setAiDiscovery(null);
+      if (aiUrlDebounceRef.current) clearTimeout(aiUrlDebounceRef.current);
+      if (next.customBaseUrl.trim()) {
+        aiUrlDebounceRef.current = setTimeout(() => {
+          void refreshAiModels(next, false);
+        }, 350);
+      }
     }
-  }, []);
+  }, [refreshAiModels]);
 
   const onSaveAiKey = useCallback(async () => {
     if (!aiConfig || aiBusy) return;
@@ -486,12 +582,15 @@ export function App() {
             : 'API key stored in memory for this session.'
           : 'API key cleared.'
       });
+      if (next.hasKey[next.provider] || (next.provider === 'custom' && next.customBaseUrl.trim())) {
+        void refreshAiModels(next, false);
+      }
     } catch (err) {
       setAiStatus({ ok: false, text: err instanceof Error ? err.message : 'Failed to save API key.' });
     } finally {
       setAiBusy(false);
     }
-  }, [aiConfig, aiKeyDraft, aiBusy]);
+  }, [aiConfig, aiKeyDraft, aiBusy, refreshAiModels]);
 
   const onClearAiKey = useCallback(async () => {
     if (!aiConfig || aiBusy) return;
@@ -501,6 +600,7 @@ export function App() {
       const next = await window.teleprompter.clearAiApiKey(aiConfig.provider);
       setAiConfig(next);
       setAiKeyDraft('');
+      setAiDiscovery(null);
       setAiStatus({ ok: true, text: 'API key cleared.' });
     } finally {
       setAiBusy(false);
@@ -508,21 +608,10 @@ export function App() {
   }, [aiConfig, aiBusy]);
 
   const onListAiModels = useCallback(async () => {
-    if (aiBusy) return;
-    setAiBusy(true);
+    if (aiBusy || aiDiscoveryLoading) return;
     setAiStatus(null);
-    try {
-      const res = await window.teleprompter.listAiModels();
-      if (res.ok) {
-        setAiListedModels(res.models);
-        setAiStatus({ ok: true, text: `Loaded ${res.models.length} model(s).` });
-      } else {
-        setAiStatus({ ok: false, text: res.error || 'Could not list models.' });
-      }
-    } finally {
-      setAiBusy(false);
-    }
-  }, [aiBusy]);
+    await refreshAiModels(aiConfig ?? undefined, true);
+  }, [aiBusy, aiDiscoveryLoading, refreshAiModels, aiConfig]);
 
   const onTestAiConnection = useCallback(async () => {
     if (aiBusy) return;
@@ -531,14 +620,16 @@ export function App() {
     try {
       const res = await window.teleprompter.testAiConnection();
       if (res.ok) {
-        setAiStatus({ ok: true, text: `Connected (${res.latencyMs ?? 0}ms): ${res.replyPreview ?? 'OK'}` });
+        const modelInfo = res.resolvedModel ? ` · ${res.resolvedModel}` : '';
+        setAiStatus({ ok: true, text: `Connected (${res.latencyMs ?? 0}ms${modelInfo}): ${res.replyPreview ?? 'OK'}` });
+        void refreshAiModels(aiConfig ?? undefined, false);
       } else {
         setAiStatus({ ok: false, text: res.error || 'Connection failed.' });
       }
     } finally {
       setAiBusy(false);
     }
-  }, [aiBusy]);
+  }, [aiBusy, aiConfig, refreshAiModels]);
 
   if (!s) return <div className="loading">Loading...</div>;
 
@@ -825,6 +916,11 @@ export function App() {
         <div className="tab-panel" data-testid="qa-panel-wrap" hidden={activeTab !== 'qa'}>
           <QaPanel
             aiConfig={aiConfig}
+            resolvedAutoModel={
+              aiDiscovery && aiDiscovery.provider === aiConfig?.provider
+                ? aiDiscovery.recommended[0] ?? null
+                : null
+            }
             currentScript={s.script}
             isQaTabActive={activeTab === 'qa'}
             sttConfig={sttConfig}
@@ -945,41 +1041,147 @@ export function App() {
                     type="button"
                     className="ai-mini-btn"
                     data-testid="ai-list-models"
-                    disabled={aiBusy}
+                    disabled={aiBusy || aiDiscoveryLoading}
                     onClick={() => void onListAiModels()}
                   >
-                    List
+                    {aiDiscoveryLoading ? 'Refreshing...' : 'Refresh'}
                   </button>
                 </div>
-                <select
-                  className="ai-select full"
-                  data-testid="ai-model-select"
-                  aria-label="Select model"
-                  value={aiConfig.model}
-                  onChange={(e) => void onAiConfigChange({ model: e.target.value })}
-                >
-                  {Array.from(
-                    new Set([
-                      ...AI_PROVIDER_PRESETS[aiConfig.provider].suggestedModels,
-                      ...aiListedModels,
-                      ...(aiConfig.model ? [aiConfig.model] : [])
-                    ])
-                  ).map((m) => (
-                    <option key={m} value={m}>{m}</option>
-                  ))}
-                  {AI_PROVIDER_PRESETS[aiConfig.provider].suggestedModels.length === 0 &&
-                    aiListedModels.length === 0 &&
-                    !aiConfig.model && <option value="">Enter model ID below</option>}
-                </select>
-                <input
-                  type="text"
-                  className="ai-text-input"
-                  data-testid="ai-model-input"
-                  aria-label="Manual Model ID"
-                  placeholder="Manual Model ID"
-                  value={aiConfig.model}
-                  onChange={(e) => void onAiConfigChange({ model: e.target.value })}
-                />
+                {(() => {
+                  const activeDiscovery =
+                    aiDiscovery && aiDiscovery.provider === aiConfig.provider ? aiDiscovery : null;
+                  const discoveredSelectable = (activeDiscovery?.models ?? []).filter(
+                    (m) => m.capability !== 'excluded'
+                  );
+                  const recommendedIds = activeDiscovery?.recommended ?? [];
+                  const recommendedModels = recommendedIds
+                    .map((id) => discoveredSelectable.find((m) => m.id === id))
+                    .filter((m): m is NonNullable<typeof m> => Boolean(m))
+                    .slice(0, 3);
+                  const topRec = recommendedModels[0];
+                  const savedModel = aiConfig.model.trim();
+                  const savedInDiscovered =
+                    Boolean(savedModel) && discoveredSelectable.some((m) => m.id === savedModel);
+                  const isRetiredSavedModel =
+                    aiConfig.modelMode === 'manual' &&
+                    Boolean(savedModel) &&
+                    !savedInDiscovered &&
+                    Boolean(
+                      activeDiscovery &&
+                        activeDiscovery.ok &&
+                        !activeDiscovery.cached &&
+                        activeDiscovery.supportsDiscovery
+                    );
+                  const selectValue = manualModelMode
+                    ? '__manual__'
+                    : aiConfig.modelMode === 'auto'
+                      ? '__auto__'
+                      : savedModel || '__auto__';
+
+                  return (
+                    <>
+                      <select
+                        className="ai-select full"
+                        data-testid="ai-model-select"
+                        aria-label="Select model"
+                        value={selectValue}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          if (val === '__manual__') {
+                            setManualModelMode(true);
+                          } else if (val === '__auto__') {
+                            setManualModelMode(false);
+                            void onAiConfigChange({ modelMode: 'auto', model: '' });
+                          } else {
+                            setManualModelMode(false);
+                            void onAiConfigChange({ modelMode: 'manual', model: val });
+                          }
+                        }}
+                      >
+                        <option value="__auto__">
+                          {topRec
+                            ? `Auto · Fast recommended (${topRec.id} · ${topRec.speedNote})`
+                            : 'Auto · Fast recommended'}
+                        </option>
+                        {recommendedModels.length > 0 && (
+                          <optgroup label="Recommended (fast Q&A)">
+                            {recommendedModels.map((m) => (
+                              <option key={`rec-${m.id}`} value={m.id}>
+                                {m.id} · {m.speedNote}
+                              </option>
+                            ))}
+                          </optgroup>
+                        )}
+                        {discoveredSelectable.length > 0 && (
+                          <optgroup label="All models">
+                            {discoveredSelectable.map((m) => (
+                              <option key={`all-${m.id}`} value={m.id}>
+                                {m.capability === 'unknown'
+                                  ? `${m.id} (unverified capabilities)`
+                                  : `${m.id}${m.observedFirstTokenMs ? ` (${m.observedFirstTokenMs}ms)` : ''}`}
+                              </option>
+                            ))}
+                          </optgroup>
+                        )}
+                        {aiConfig.modelMode === 'manual' && savedModel && !savedInDiscovered && (
+                          <option value={savedModel}>
+                            {isRetiredSavedModel
+                              ? `${savedModel} (Unavailable / retired)`
+                              : `${savedModel} (saved)`}
+                          </option>
+                        )}
+                        <option value="__manual__">Enter model ID manually</option>
+                      </select>
+                      {isRetiredSavedModel && (
+                        <div className="ai-status err" data-testid="ai-model-retired">
+                          <span>
+                            Saved model &ldquo;{savedModel}&rdquo; was not found in the live{' '}
+                            {AI_PROVIDER_PRESETS[aiConfig.provider].label} catalog.
+                          </span>{' '}
+                          <button
+                            type="button"
+                            className="ai-mini-btn"
+                            data-testid="ai-model-replace-btn"
+                            onClick={() => {
+                              setManualModelMode(false);
+                              if (topRec) {
+                                void onAiConfigChange({ modelMode: 'manual', model: topRec.id });
+                              } else {
+                                void onAiConfigChange({ modelMode: 'auto', model: '' });
+                              }
+                            }}
+                          >
+                            {topRec ? `Use ${topRec.id}` : 'Switch to Auto'}
+                          </button>
+                        </div>
+                      )}
+                      {activeDiscovery && !activeDiscovery.supportsDiscovery && (
+                        <div className="ai-status" data-testid="ai-discovery-note">
+                          Endpoint does not support /models discovery — enter a model ID manually and use Test Connection.
+                        </div>
+                      )}
+                      {activeDiscovery && activeDiscovery.cached && (
+                        <div className="ai-status" data-testid="ai-discovery-cached">
+                          Cached list · {activeDiscovery.error || 'Refresh failed'}
+                        </div>
+                      )}
+                    </>
+                  );
+                })()}
+                {manualModelMode && (
+                  <label className="ai-field">
+                    <span>Manual Model ID</span>
+                    <input
+                      type="text"
+                      className="ai-text-input"
+                      data-testid="ai-model-input"
+                      aria-label="Manual Model ID"
+                      placeholder="Enter model ID..."
+                      value={aiConfig.model}
+                      onChange={(e) => void onAiConfigChange({ modelMode: 'manual', model: e.target.value })}
+                    />
+                  </label>
+                )}
               </div>
               <div className="ai-field">
                 <span>API Key</span>
@@ -1037,54 +1239,131 @@ export function App() {
           )}
           {sttConfig && (
             <div className="settings-ai-section" data-testid="stt-settings">
-              <div className="settings-ai-title">Voice / Whisper (Local)</div>
+              <div className="settings-ai-title">Voice / Speech-to-Text</div>
+              <label className="row">
+                <span>Speech-to-text</span>
+                <select
+                  className="ai-select"
+                  data-testid="stt-provider"
+                  aria-label="Speech-to-text provider"
+                  value={sttConfig.provider}
+                  onChange={(e) => void onSttConfigChange({ provider: e.target.value as SttProviderId })}
+                >
+                  <option value="whisper">Local Whisper</option>
+                  <option value="deepgram">Deepgram</option>
+                </select>
+              </label>
+              {sttConfig.provider === 'deepgram' && (
+                <div className="qa-disclosure" data-testid="stt-deepgram-notice">
+                  Audio is sent to Deepgram.
+                </div>
+              )}
               <div className="row">
                 <span>Auto-listen in AI Q&amp;A</span>
                 <button
                   type="button"
                   role="switch"
                   aria-checked={sttConfig.autoListen}
+                  aria-label="Auto-listen in AI Q&A"
+                  title="Toggle Auto-listen in AI Q&A"
                   data-testid="stt-autolisten-toggle"
-                  className={`switch ${sttConfig.autoListen ? 'on' : ''}`}
+                  className={`theme-switch ${sttConfig.autoListen ? 'on' : 'off'}`}
                   onClick={() => void onSttConfigChange({ autoListen: !sttConfig.autoListen })}
-                />
+                >
+                  {sttConfig.autoListen ? 'ON' : 'OFF'}
+                </button>
               </div>
-              <div className="ai-field">
+              <label className="ai-field">
                 <span>Language</span>
                 <input
                   type="text"
                   className="ai-text-input"
                   data-testid="stt-language"
-                  aria-label="Whisper language"
+                  aria-label="Speech language"
                   placeholder="en"
                   value={sttConfig.language}
                   onChange={(e) => void onSttConfigChange({ language: e.target.value })}
                 />
-              </div>
-              <div className="ai-field">
-                <span>Whisper Model (.bin)</span>
-                <input
-                  type="text"
-                  className="ai-text-input"
-                  data-testid="stt-model-path"
-                  aria-label="Whisper model path"
-                  placeholder="Path to ggml-*.bin"
-                  value={sttConfig.modelPath}
-                  onChange={(e) => void onSttConfigChange({ modelPath: e.target.value })}
-                />
-              </div>
-              <div className="ai-field">
-                <span>whisper.cpp Binary</span>
-                <input
-                  type="text"
-                  className="ai-text-input"
-                  data-testid="stt-binary-path"
-                  aria-label="whisper.cpp binary path"
-                  placeholder="Path to whisper-cli.exe"
-                  value={sttConfig.binaryPath}
-                  onChange={(e) => void onSttConfigChange({ binaryPath: e.target.value })}
-                />
-              </div>
+              </label>
+              {sttConfig.provider === 'deepgram' ? (
+                <>
+                  <label className="ai-field">
+                    <span>Deepgram Model</span>
+                    <select
+                      className="ai-select full"
+                      data-testid="stt-deepgram-model"
+                      aria-label="Deepgram model"
+                      value={sttConfig.deepgramModel}
+                      onChange={(e) =>
+                        void onSttConfigChange({ deepgramModel: e.target.value as DeepgramModelId })
+                      }
+                    >
+                      <option value="flux-general-en">Flux English (flux-general-en)</option>
+                      <option value="nova-3">Nova-3 (nova-3)</option>
+                    </select>
+                  </label>
+                  <div className="ai-field">
+                    <span>Deepgram API Key</span>
+                    <div className="ai-key-row">
+                      <input
+                        type="password"
+                        className="ai-text-input"
+                        data-testid="stt-deepgram-key-input"
+                        aria-label="Deepgram API Key"
+                        placeholder={sttConfig.hasDeepgramKey ? 'Saved (encrypted)' : 'Enter Deepgram key...'}
+                        value={deepgramKeyDraft}
+                        onChange={(e) => setDeepgramKeyDraft(e.target.value)}
+                      />
+                      <button
+                        type="button"
+                        className="ai-mini-btn"
+                        data-testid="stt-deepgram-key-save"
+                        disabled={!deepgramKeyDraft.trim()}
+                        onClick={() => void onSaveDeepgramKey()}
+                      >
+                        Save
+                      </button>
+                      {sttConfig.hasDeepgramKey && (
+                        <button
+                          type="button"
+                          className="ai-mini-btn"
+                          data-testid="stt-deepgram-key-clear"
+                          onClick={() => void onClearDeepgramKey()}
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <label className="ai-field">
+                    <span>Whisper executable (.exe)</span>
+                    <input
+                      type="text"
+                      className="ai-text-input"
+                      data-testid="stt-binary-path"
+                      aria-label="Whisper executable (.exe)"
+                      placeholder="Path to whisper-cli.exe"
+                      value={sttConfig.binaryPath}
+                      onChange={(e) => void onSttConfigChange({ binaryPath: e.target.value })}
+                    />
+                  </label>
+                  <label className="ai-field">
+                    <span>Whisper model (.bin)</span>
+                    <input
+                      type="text"
+                      className="ai-text-input"
+                      data-testid="stt-model-path"
+                      aria-label="Whisper model (.bin)"
+                      placeholder="Path to ggml-*.bin"
+                      value={sttConfig.modelPath}
+                      onChange={(e) => void onSttConfigChange({ modelPath: e.target.value })}
+                    />
+                  </label>
+                </>
+              )}
               {sttStatus && !sttStatus.available && sttStatus.reason && (
                 <div className="ai-test-status err" data-testid="stt-status-reason">
                   {sttStatus.reason}

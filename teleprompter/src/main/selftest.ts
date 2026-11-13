@@ -1,9 +1,13 @@
 import { app, BrowserWindow, clipboard, globalShortcut, safeStorage } from 'electron';
+import crypto from 'node:crypto';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { SettingsStore } from './settingsStore';
 import type { WhisperSttService } from './whisperStt';
+import { AiProviderService } from './aiProvider';
+import { AiSecretStore } from './aiSecretStore';
+import { QaKnowledgeStore } from './qaKnowledge';
 import { computeSlideProgress, parseSlides } from '../shared/slides';
 import type { ShortcutAction, ShortcutBindingStatus } from '../shared/types';
 
@@ -1071,7 +1075,7 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
 
       // 2. Loopback HTTP mock: listModels, testConnection (no presentation content), and error classification
       await js(win, `window.teleprompter.updateAiConfig({ provider: 'custom', customBaseUrl: ${JSON.stringify(mockBaseUrl)}, model: 'mock-model-a' })`);
-      const modelsRes = await js<{ ok: boolean; models: string[] }>(win, `window.teleprompter.listAiModels()`);
+      const modelsRes = await js<{ ok: boolean; models: Array<{ id: string }> }>(win, `window.teleprompter.listAiModels()`);
       const testOkRes = await js<{ ok: boolean; replyPreview?: string }>(win, `window.teleprompter.testAiConnection()`);
       const noPresentationLeak = lastTestBody.includes('Reply with OK.') && !lastTestBody.includes('Opening sentence');
 
@@ -1098,6 +1102,14 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
         prov.dispatchEvent(new Event('change', { bubbles: true }));
       })()`);
       await sleep(80);
+      const manualHiddenInitially = await js<boolean>(win, `!document.querySelector('[data-testid="ai-model-input"]')`);
+      await js(win, `(() => {
+        const modSel = document.querySelector('[data-testid="ai-model-select"]');
+        const setSel = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
+        setSel.call(modSel, '__manual__');
+        modSel.dispatchEvent(new Event('change', { bubbles: true }));
+      })()`);
+      await sleep(60);
       await js(win, `(() => {
         const urlInp = document.querySelector('[data-testid="ai-custom-url"]');
         const modInp = document.querySelector('[data-testid="ai-model-input"]');
@@ -1112,9 +1124,10 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
       await sleep(80);
 
       check('AI provider security & error classification (HTTPS enforcement, encrypted key, no redirect/leak, 401/404/429/offline)',
+        manualHiddenInitially &&
         !remoteHttpErr.ok && remoteHttpErr.errorKind === 'invalid_endpoint' &&
         keyNotExposed &&
-        modelsRes.ok && modelsRes.models.includes('mock-model-a') &&
+        modelsRes.ok && modelsRes.models.some((m) => m.id === 'mock-model-a') &&
         testOkRes.ok && noPresentationLeak &&
         errKey.errorKind === 'invalid_key' &&
         errModel.errorKind === 'unavailable_model' &&
@@ -1435,11 +1448,13 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
       }
       const afterEditCount = await js<number>(win, `document.querySelectorAll('[data-testid="qa-msg-assistant"]').length`);
 
-      // Refresh sttStatus in renderer (mockTranscriber makes it available: true)
+      // Refresh sttStatus in renderer (mockTranscriber makes it available: true) and verify Auto-listen ON/OFF control
       await click(win, 'settings');
       await sleep(50);
+      const autoListenOffText = await js<string>(win, `document.querySelector('[data-testid="stt-autolisten-toggle"]')?.textContent?.trim() ?? ''`);
       await click(win, 'stt-autolisten-toggle');
       await sleep(50);
+      const autoListenOnText = await js<string>(win, `document.querySelector('[data-testid="stt-autolisten-toggle"]')?.textContent?.trim() ?? ''`);
       await click(win, 'stt-autolisten-toggle');
       await sleep(50);
       await click(win, 'settings');
@@ -1516,6 +1531,11 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
         initialSttCfg.language === 'en' &&
         initialSttCfg.autoListen === false &&
         initialSttStatus.available === false &&
+        (initialSttStatus.reason || '').includes('Whisper executable (.exe)') &&
+        (initialSttStatus.reason || '').includes('Whisper model (.bin)') &&
+        (initialSttStatus.reason || '').includes('Typed Q&A still works') &&
+        autoListenOffText === 'OFF' &&
+        autoListenOnText === 'ON' &&
         typedInputUsableWhenUnavailable &&
         liveText.includes('Why did you') &&
         callsAfterPartial === callsBeforePartial &&
@@ -1560,9 +1580,518 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
         })
       );
       console.log(`METRIC endOfQuestionToFirstAnswerMs=${endOfQuestionToFirstAnswerMs}`);
+
+      // ── Deepgram Streaming STT (Flux & Nova-3) self-test ─────────────────
+      const wsSockets: Array<import('node:stream').Duplex> = [];
+      let wsConnectCount = 0;
+      let wsLastUrl = '';
+      let wsAuthHeaderOk = false;
+      let wsReject401 = false;
+      let wsReceivedCloseStream = false;
+
+      const sendWsText = (sock: import('node:stream').Duplex, payload: string) => {
+        if (sock.destroyed) return;
+        const data = Buffer.from(payload, 'utf8');
+        const len = data.length;
+        const hdr = len < 126
+          ? Buffer.from([0x81, len])
+          : Buffer.from([0x81, 126, (len >> 8) & 0xff, len & 0xff]);
+        sock.write(Buffer.concat([hdr, data]));
+      };
+
+      const dgMockServer = http.createServer((_req, res) => {
+        res.writeHead(404);
+        res.end();
+      });
+      dgMockServer.on('upgrade', (req, socket) => {
+        if (wsReject401) {
+          socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        wsConnectCount += 1;
+        wsLastUrl = req.url || '';
+        wsAuthHeaderOk = req.headers.authorization === 'Token dg-selftest-key-123';
+        const key = String(req.headers['sec-websocket-key'] || '');
+        const accept = crypto
+          .createHash('sha1')
+          .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
+          .digest('base64');
+        socket.write(
+          'HTTP/1.1 101 Switching Protocols\r\n' +
+          'Upgrade: websocket\r\n' +
+          'Connection: Upgrade\r\n' +
+          `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+        );
+        wsSockets.push(socket);
+        socket.on('data', (chunk) => {
+          // Unmask client-to-server RFC 6455 frames to inspect CloseStream JSON
+          let off = 0;
+          while (off + 2 <= chunk.length) {
+            const b0 = chunk[off];
+            const b1 = chunk[off + 1];
+            const op = b0 & 0x0f;
+            const masked = (b1 & 0x80) !== 0;
+            let len = b1 & 0x7f;
+            let hdr = 2;
+            if (len === 126 && off + 4 <= chunk.length) {
+              len = chunk.readUInt16BE(off + 2);
+              hdr = 4;
+            } else if (len === 127 && off + 10 <= chunk.length) {
+              len = Number(chunk.readBigUInt64BE(off + 2));
+              hdr = 10;
+            }
+            const mLen = masked ? 4 : 0;
+            if (off + hdr + mLen + len > chunk.length) break;
+            if (op === 0x01 && masked) {
+              const mask = chunk.subarray(off + hdr, off + hdr + 4);
+              const out = Buffer.allocUnsafe(len);
+              for (let i = 0; i < len; i++) out[i] = chunk[off + hdr + 4 + i] ^ mask[i & 3];
+              if (out.toString('utf8').includes('CloseStream')) wsReceivedCloseStream = true;
+            }
+            off += hdr + mLen + len;
+          }
+        });
+      });
+
+      await new Promise<void>((resolve) => dgMockServer.listen(0, '127.0.0.1', () => resolve()));
+      const dgAddr = dgMockServer.address();
+      const dgPort = typeof dgAddr === 'object' && dgAddr ? dgAddr.port : 0;
+      ctx.sttService.setDeepgramTestBaseUrl(`ws://127.0.0.1:${dgPort}`);
+
+      try {
+        // 1) Local Whisper default: no cloud connection opened
+        const defaultProvider = ctx.sttService.getConfig().provider;
+        const wsCountUnderWhisper = wsConnectCount;
+
+        // 2) Switch to Deepgram in Settings UI -> shows "Audio is sent to Deepgram", save encrypted key
+        await click(win, 'settings');
+        await sleep(60);
+        await js(win, `(() => {
+          const sel = document.querySelector('[data-testid="stt-provider"]');
+          const setSel = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
+          setSel.call(sel, 'deepgram');
+          sel.dispatchEvent(new Event('change', { bubbles: true }));
+        })()`);
+        await sleep(60);
+        const settingsNotice = await js<string>(win, `document.querySelector('[data-testid="stt-deepgram-notice"]')?.textContent?.trim() ?? ''`);
+        await js(win, `(() => {
+          const inp = document.querySelector('[data-testid="stt-deepgram-key-input"]');
+          const setInp = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+          setInp.call(inp, 'dg-selftest-key-123');
+          inp.dispatchEvent(new Event('input', { bubbles: true }));
+        })()`);
+        await sleep(40);
+        await click(win, 'stt-deepgram-key-save');
+        await sleep(80);
+        const publicSttCfg = await js<{ hasDeepgramKey?: boolean; serialized: string }>(win, `(async () => {
+          const cfg = await window.teleprompter.getSttConfig();
+          return { hasDeepgramKey: cfg.hasDeepgramKey, serialized: JSON.stringify(cfg) };
+        })()`);
+        const dgKeyNotExposed = publicSttCfg.hasDeepgramKey === true && !publicSttCfg.serialized.includes('dg-selftest-key-123');
+        await click(win, 'settings');
+        await sleep(60);
+
+        const qaNotice = await js<string>(win, `document.querySelector('[data-testid="qa-deepgram-notice"]')?.textContent?.trim() ?? ''`);
+
+        // 3) Flux English: StartOfTurn + EagerEndOfTurn stay interim; duplicate EndOfTurn submits once
+        const beforeFluxCount = await js<number>(win, `document.querySelectorAll('[data-testid="qa-msg-assistant"]').length`);
+        await click(win, 'mic-start');
+        for (let t = 0; t < 20; t++) {
+          await sleep(40);
+          if (wsSockets.length >= 1) break;
+        }
+        const fluxSock = wsSockets[0];
+        const fluxUrlOk = wsLastUrl.includes('/v2/listen') && wsLastUrl.includes('model=flux-general-en');
+        sendWsText(fluxSock, JSON.stringify({ type: 'TurnInfo', event: 'StartOfTurn', turn_index: 0, transcript: 'Why did you' }));
+        sendWsText(fluxSock, JSON.stringify({ type: 'TurnInfo', event: 'EagerEndOfTurn', turn_index: 0, transcript: 'Why did you pick' }));
+        await sleep(100);
+        const fluxInterim = await js<string>(win, `document.querySelector('[data-testid="qa-live-transcript"]')?.textContent?.trim() ?? ''`);
+        const countAfterEager = await js<number>(win, `document.querySelectorAll('[data-testid="qa-msg-assistant"]').length`);
+
+        sendWsText(fluxSock, JSON.stringify({ type: 'TurnInfo', event: 'EndOfTurn', turn_index: 0, transcript: 'Why did you pick Vulkan?' }));
+        sendWsText(fluxSock, JSON.stringify({ type: 'TurnInfo', event: 'EndOfTurn', turn_index: 0, transcript: 'Why did you pick Vulkan?' }));
+        await sleep(140);
+        const afterFluxCount = await js<number>(win, `document.querySelectorAll('[data-testid="qa-msg-assistant"]').length`);
+
+        // Stop mic -> late event from closed session must be discarded
+        await click(win, 'mic-stop');
+        await sleep(80);
+        sendWsText(fluxSock, JSON.stringify({ type: 'TurnInfo', event: 'EndOfTurn', turn_index: 1, transcript: 'Late closed question?' }));
+        await sleep(80);
+        const countAfterLate = await js<number>(win, `document.querySelectorAll('[data-testid="qa-msg-assistant"]').length`);
+
+        // 4) Nova-3: short pause (is_final:true, speech_final:false) accumulates; UtteranceEnd submits once
+        await js(win, `window.teleprompter.updateSttConfig({ deepgramModel: 'nova-3' })`);
+        await click(win, 'settings');
+        await sleep(50);
+        await click(win, 'settings');
+        await sleep(50);
+        await click(win, 'mic-start');
+        for (let t = 0; t < 20; t++) {
+          await sleep(40);
+          if (wsSockets.length >= 2) break;
+        }
+        const novaSock = wsSockets[1];
+        const novaUrlOk = wsLastUrl.includes('/v1/listen') && wsLastUrl.includes('model=nova-3');
+        sendWsText(novaSock, JSON.stringify({ type: 'Results', is_final: false, speech_final: false, channel: { alternatives: [{ transcript: 'How does' }] } }));
+        sendWsText(novaSock, JSON.stringify({ type: 'Results', is_final: true, speech_final: false, channel: { alternatives: [{ transcript: 'How does spatial' }] } }));
+        await sleep(100);
+        const novaPauseInterim = await js<string>(win, `document.querySelector('[data-testid="qa-live-transcript"]')?.textContent?.trim() ?? ''`);
+        const countDuringPause = await js<number>(win, `document.querySelectorAll('[data-testid="qa-msg-assistant"]').length`);
+
+        sendWsText(novaSock, JSON.stringify({ type: 'Results', is_final: true, speech_final: false, channel: { alternatives: [{ transcript: 'audio work?' }] } }));
+        sendWsText(novaSock, JSON.stringify({ type: 'UtteranceEnd' }));
+        for (let t = 0; t < 30; t++) {
+          await sleep(60);
+          const st = await js<string>(win, `document.querySelector('[data-testid="qa-status"]')?.textContent?.trim() ?? ''`);
+          const cnt = await js<number>(win, `document.querySelectorAll('[data-testid="qa-msg-assistant"]').length`);
+          if (cnt > afterFluxCount && st === 'Ready') break;
+        }
+        const afterNovaCount = await js<number>(win, `document.querySelectorAll('[data-testid="qa-msg-assistant"]').length`);
+        await click(win, 'mic-stop');
+        await sleep(60);
+
+        // 5) Auth failure (401) -> shows error, typed Q&A still usable, switch back to Local Whisper
+        wsReject401 = true;
+        await click(win, 'mic-start');
+        await sleep(150);
+        const dgAuthError = await js<string>(win, `document.querySelector('[data-testid="mic-error"]')?.textContent?.trim() ?? ''`);
+        const typedUsableAfterDgErr = await js<boolean>(win, `Boolean(document.querySelector('[data-testid="qa-input"]') && !document.querySelector('[data-testid="qa-input"]').disabled)`);
+        await js(win, `window.teleprompter.updateSttConfig({ provider: 'whisper' })`);
+        await js(win, `window.teleprompter.clearDeepgramApiKey()`);
+
+        check(
+          'Deepgram STT: Whisper default (0 cloud connects), key isolation, Flux EndOfTurn & dedupe, Nova-3 pause accumulation, late-event discard, and 401 fallback',
+          defaultProvider === 'whisper' &&
+          wsCountUnderWhisper === 0 &&
+          settingsNotice.includes('Audio is sent to Deepgram') &&
+          qaNotice.includes('Audio is sent to Deepgram') &&
+          dgKeyNotExposed &&
+          wsAuthHeaderOk &&
+          fluxUrlOk &&
+          fluxInterim.includes('Why did you pick') &&
+          countAfterEager === beforeFluxCount &&
+          afterFluxCount === beforeFluxCount + 1 &&
+          wsReceivedCloseStream &&
+          countAfterLate === afterFluxCount &&
+          novaUrlOk &&
+          novaPauseInterim.includes('How does spatial') &&
+          countDuringPause === afterFluxCount &&
+          afterNovaCount === afterFluxCount + 1 &&
+          dgAuthError.includes('401') &&
+          typedUsableAfterDgErr,
+          JSON.stringify({
+            defaultProvider,
+            wsCountUnderWhisper,
+            settingsNotice,
+            qaNotice,
+            dgKeyNotExposed,
+            wsAuthHeaderOk,
+            fluxUrlOk,
+            fluxInterim,
+            countAfterEager,
+            beforeFluxCount,
+            afterFluxCount,
+            wsReceivedCloseStream,
+            countAfterLate,
+            novaUrlOk,
+            novaPauseInterim,
+            countDuringPause,
+            afterNovaCount,
+            dgAuthError,
+            typedUsableAfterDgErr
+          })
+        );
+      } finally {
+        ctx.sttService.setDeepgramTestBaseUrl(null);
+        for (const s of wsSockets) {
+          try { s.destroy(); } catch { /* ignore */ }
+        }
+        dgMockServer.close();
+      }
     } finally {
       ctx.sttService.setMockTranscriber(null);
       mockServer.close();
+    }
+
+    // Live speed-first AI model discovery, capability filtering, Auto resolution, and UI picker tests
+    {
+      const tmpDir = fs.mkdtempSync(path.join(app.getPath('temp'), 'tp-discovery-'));
+      const origFetch = globalThis.fetch;
+      const fetchCalls: Array<{ url: string; method: string }> = [];
+      let failGroqRefresh = false;
+      let customNoListing = false;
+
+      const testStore = new AiSecretStore(tmpDir);
+      const testKb = new QaKnowledgeStore(tmpDir);
+      const testProvider = new AiProviderService();
+
+      testStore.setApiKey('gemini', 'test-gemini-key');
+      testStore.setApiKey('groq', 'test-groq-key');
+      testStore.setApiKey('nvidia', 'test-nvidia-key');
+      testStore.setApiKey('custom', 'test-custom-key');
+
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        const method = init?.method ?? 'GET';
+        fetchCalls.push({ url, method });
+
+        if (url === 'https://generativelanguage.googleapis.com/v1beta/models') {
+          return new Response(
+            JSON.stringify({
+              models: [
+                { name: 'models/gemini-2.5-pro', displayName: 'Gemini 2.5 Pro', supportedGenerationMethods: ['generateContent'] },
+                { name: 'models/gemini-2.5-flash', displayName: 'Gemini 2.5 Flash', supportedGenerationMethods: ['generateContent'] },
+                { name: 'models/text-embedding-004', displayName: 'Embedding', supportedGenerationMethods: ['embedContent'] },
+                { name: 'models/imagen-3.0-generate-002', displayName: 'Imagen 3', supportedGenerationMethods: ['predict'] }
+              ]
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } }
+          );
+        }
+
+        if (url === 'https://api.groq.com/openai/v1/models') {
+          if (failGroqRefresh) {
+            return new Response(JSON.stringify({ error: { message: 'Temporary outage' } }), {
+              status: 503,
+              headers: { 'content-type': 'application/json' }
+            });
+          }
+          return new Response(
+            JSON.stringify({
+              data: [
+                { id: 'llama-3.3-70b-versatile', active: true },
+                { id: 'llama-3.1-8b-instant', active: true },
+                { id: 'whisper-large-v3', active: true },
+                { id: 'llama-guard-3-8b', active: true }
+              ]
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } }
+          );
+        }
+
+        if (url === 'https://integrate.api.nvidia.com/v1/models') {
+          return new Response(
+            JSON.stringify({
+              data: [
+                { id: 'meta/llama-3.3-70b-instruct' },
+                { id: 'nvidia/nv-embedqa-e5-v5' },
+                { id: 'nvidia/llama-3.2-nemoretriever-300m-embed-v1' },
+                { id: 'meta/llama-3.1-8b-instruct' }
+              ]
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } }
+          );
+        }
+
+        if (url === 'https://custom-llm.example.com/v1/models') {
+          if (customNoListing) {
+            return new Response('Not Found', { status: 404 });
+          }
+          return new Response(
+            JSON.stringify({
+              data: [
+                { id: 'custom-internal-v1' },
+                { id: 'llama-3.1-8b-instruct', capabilities: { chat: true } },
+                { id: 'bge-large-en-v1.5', type: 'embedding' }
+              ]
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } }
+          );
+        }
+
+        if (url.endsWith('/chat/completions')) {
+          const body = typeof init?.body === 'string' ? JSON.parse(init.body) as { model?: string } : {};
+          // Simulate slower latency for 8b vs faster for 70b when testing observed TTFT override
+          if (body.model === 'llama-3.1-8b-instant') await sleep(40);
+          return new Response(
+            JSON.stringify({ choices: [{ message: { content: 'OK' } }] }),
+            { status: 200, headers: { 'content-type': 'application/json' } }
+          );
+        }
+
+        return new Response('Unhandled', { status: 500 });
+      }) as typeof fetch;
+
+      try {
+        // 1. Gemini capability filtering + speed-first ranking (no background generation calls)
+        testStore.updateConfig({ provider: 'gemini', modelMode: 'auto', model: '' });
+        const gemList = await testProvider.listModels(testStore);
+        const gemProbeCount = fetchCalls.filter((c) => c.url.endsWith('/chat/completions')).length;
+        const gemEmbedExcluded = gemList.models.find((m) => m.id === 'text-embedding-004')?.capability === 'excluded';
+        const gemImagenExcluded = gemList.models.find((m) => m.id === 'imagen-3.0-generate-002')?.capability === 'excluded';
+        const gemAutoTest = await testProvider.testConnection(testStore);
+
+        // 2. Groq exclusion + retired saved model preserved + failed refresh preserves cache
+        testStore.updateConfig({ provider: 'groq', modelMode: 'manual', model: 'mixtral-8x7b-32768' });
+        const groqList = await testProvider.listModels(testStore);
+        const groqWhisperExcluded = groqList.models.find((m) => m.id === 'whisper-large-v3')?.capability === 'excluded';
+        const groqGuardExcluded = groqList.models.find((m) => m.id === 'llama-guard-3-8b')?.capability === 'excluded';
+        const groqRetiredAbsent = !groqList.models.some((m) => m.id === 'mixtral-8x7b-32768');
+        const groqSavedPreserved = testStore.getPublicConfig().model === 'mixtral-8x7b-32768';
+
+        failGroqRefresh = true;
+        const groqCachedFail = await testProvider.listModels(testStore);
+        failGroqRefresh = false;
+
+        // Observed TTFT ranking: testConnection on llama-3.3-70b-versatile (~1-5ms) vs llama-3.1-8b-instant (~40ms+)
+        testStore.updateConfig({ provider: 'groq', modelMode: 'manual', model: 'llama-3.3-70b-versatile' });
+        await testProvider.testConnection(testStore);
+        testStore.updateConfig({ provider: 'groq', modelMode: 'manual', model: 'llama-3.1-8b-instant' });
+        await testProvider.testConnection(testStore);
+        const groqAfterObs = await testProvider.listModels(testStore);
+
+        // 3. NVIDIA NIM exclusion + recommendation
+        testStore.updateConfig({ provider: 'nvidia', modelMode: 'auto', model: '' });
+        const nvList = await testProvider.listModels(testStore);
+        const nvEmbedExcluded = nvList.models.find((m) => m.id === 'nvidia/nv-embedqa-e5-v5')?.capability === 'excluded';
+
+        // 4. Custom: unknown-capability excluded from Auto/top-3 but manually testable; 404 unsupported discovery
+        testStore.updateConfig({
+          provider: 'custom',
+          customBaseUrl: 'https://custom-llm.example.com/v1',
+          modelMode: 'auto',
+          model: ''
+        });
+        const customList = await testProvider.listModels(testStore);
+        const customUnknown = customList.models.find((m) => m.id === 'custom-internal-v1');
+        const customUnknownNotInRec = !customList.recommended.includes('custom-internal-v1');
+        testStore.updateConfig({ provider: 'custom', modelMode: 'manual', model: 'custom-internal-v1' });
+        const customManualTest = await testProvider.testConnection(testStore);
+
+        customNoListing = true;
+        const customNoDisc = await testProvider.listModels(testStore);
+        const customManualStillWorks = await testProvider.testConnection(testStore);
+        customNoListing = false;
+
+        // 5. Local Q&A approved match makes 0 answer-provider calls
+        testKb.update({
+          approvedPairs: [
+            { id: 'p-local', question: 'Why did you choose Vulkan?', answer: 'Lower driver overhead.', reference: 'Slide 3' }
+          ]
+        });
+        const callsBeforeLocalQa = fetchCalls.length;
+        let localAnswer = '';
+        await new Promise<void>((resolve) => {
+          testProvider.startStream(testStore, testKb, { question: 'Why did you choose Vulkan?' }, {
+            onSources: () => {},
+            onDelta: (t) => { localAnswer += t; },
+            onDone: () => resolve(),
+            onError: () => resolve(),
+            onCancelled: () => resolve()
+          });
+        });
+        const callsAfterLocalQa = fetchCalls.length;
+
+        check(
+          'Live speed-first model discovery (Gemini/Groq/NVIDIA/Custom filtering, observed TTFT ranking, cache on failure, unknown-capability manual test, 0-probe & local Q&A 0-call)',
+          gemList.ok &&
+          gemProbeCount === 0 &&
+          gemEmbedExcluded &&
+          gemImagenExcluded &&
+          gemList.recommended[0] === 'gemini-2.5-flash' &&
+          gemAutoTest.ok &&
+          gemAutoTest.resolvedModel === 'gemini-2.5-flash' &&
+          groqList.ok &&
+          groqWhisperExcluded &&
+          groqGuardExcluded &&
+          groqRetiredAbsent &&
+          groqSavedPreserved &&
+          groqList.recommended[0] === 'llama-3.1-8b-instant' &&
+          !groqCachedFail.ok &&
+          groqCachedFail.cached === true &&
+          groqCachedFail.recommended.length > 0 &&
+          groqAfterObs.recommended[0] === 'llama-3.3-70b-versatile' &&
+          nvList.ok &&
+          nvEmbedExcluded &&
+          nvList.recommended[0] === 'meta/llama-3.1-8b-instruct' &&
+          customList.ok &&
+          customUnknown?.capability === 'unknown' &&
+          customUnknownNotInRec &&
+          customManualTest.ok &&
+          !customNoDisc.ok &&
+          customNoDisc.supportsDiscovery === false &&
+          customManualStillWorks.ok &&
+          localAnswer.includes('Lower driver overhead') &&
+          callsAfterLocalQa === callsBeforeLocalQa,
+          JSON.stringify({
+            gemRec: gemList.recommended,
+            gemProbeCount,
+            gemAutoResolved: gemAutoTest.resolvedModel,
+            groqRec: groqList.recommended,
+            groqObsRec: groqAfterObs.recommended,
+            groqCachedFail: { ok: groqCachedFail.ok, cached: groqCachedFail.cached },
+            nvRec: nvList.recommended,
+            customRec: customList.recommended,
+            customUnknownCap: customUnknown?.capability,
+            customNoDisc: customNoDisc.supportsDiscovery,
+            localCallsDelta: callsAfterLocalQa - callsBeforeLocalQa
+          })
+        );
+      } finally {
+        globalThis.fetch = origFetch;
+        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+
+      // 6. UI model picker: Auto first, retired saved model warning & same-provider replacement
+      const retiredMockServer = http.createServer((req, res) => {
+        if (req.url === '/v1/models') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ data: [{ id: 'llama-3.1-8b-instant' }, { id: 'llama-3.3-70b-versatile' }] }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { content: 'OK' } }] }));
+      });
+      await new Promise<void>((resolve) => retiredMockServer.listen(0, '127.0.0.1', () => resolve()));
+      try {
+        const rAddr = retiredMockServer.address();
+        const rPort = typeof rAddr === 'object' && rAddr ? rAddr.port : 0;
+        const rUrl = `http://127.0.0.1:${rPort}/v1`;
+        await js(win, `window.teleprompter.updateAiConfig({ provider: 'custom', customBaseUrl: ${JSON.stringify(rUrl)}, modelMode: 'manual', model: 'mixtral-8x7b-32768' })`);
+        await click(win, 'settings');
+        await sleep(80);
+        await click(win, 'ai-list-models');
+        await sleep(180);
+        const uiPickerState = await js<{
+          firstOptVal: string;
+          hasRetiredBanner: boolean;
+          hasReplaceBtn: boolean;
+        }>(win, `(() => {
+          const sel = document.querySelector('[data-testid="ai-model-select"]');
+          return {
+            firstOptVal: sel?.options?.[0]?.value ?? '',
+            hasRetiredBanner: Boolean(document.querySelector('[data-testid="ai-model-retired"]')),
+            hasReplaceBtn: Boolean(document.querySelector('[data-testid="ai-model-replace-btn"]'))
+          };
+        })()`);
+        if (uiPickerState.hasReplaceBtn) {
+          await click(win, 'ai-model-replace-btn');
+          await sleep(100);
+        }
+        const replacedCfg = await js<{ model: string; hasRetiredAfter: boolean }>(win, `(async () => {
+          const cfg = await window.teleprompter.getAiConfig();
+          return {
+            model: cfg.model,
+            hasRetiredAfter: Boolean(document.querySelector('[data-testid="ai-model-retired"]'))
+          };
+        })()`);
+        await click(win, 'settings');
+        await sleep(60);
+
+        check(
+          'UI Model Picker: Auto first, retired saved model warning, and same-provider replacement',
+          uiPickerState.firstOptVal === '__auto__' &&
+          uiPickerState.hasRetiredBanner &&
+          uiPickerState.hasReplaceBtn &&
+          replacedCfg.model === 'llama-3.1-8b-instant' &&
+          !replacedCfg.hasRetiredAfter,
+          JSON.stringify({ uiPickerState, replacedCfg })
+        );
+      } finally {
+        retiredMockServer.close();
+      }
     }
 
     check('window flags', win.isAlwaysOnTop());

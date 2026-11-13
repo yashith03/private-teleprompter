@@ -24,7 +24,7 @@ export interface SlideProgressState {
 }
 
 const HEADING_RE =
-  /^(?:#{1,6}\s+|\*\*|__|\[|\()?\s*slide\s+#?0*(\d+)(?:\s*(?:\*\*|__|\]|\)))?(?:\s*(?:[:\-\u2013\u2014|.)]+)\s*(.*))?$/i;
+  /^(?:#{1,6}\s+|\*\*|__|\[|\()?\s*slide\s+#?0*(\d+)(?:\s*(?:\*\*|__|\]|\)))?(?:(?:\s*[:\-\u2013\u2014|.)]+\s*|[ \t]{2,})(.*))?$/i;
 
 const MAX_HEADING_LINE_LEN = 100;
 const MAX_GAP_EXPANSION = 50;
