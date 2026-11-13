@@ -39,7 +39,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .privacy {
   display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px 0 8px;
   border-radius: 999px; border: 1px solid; font-size: 12px; font-weight: 600; white-space: nowrap;
+  user-select: none; -webkit-user-select: none; cursor: default;
 }
+.privacy * { cursor: default; user-select: none; -webkit-user-select: none; }
 .privacy.on { background: var(--blue-soft); border-color: var(--blue-border); color: #1d4ed8; }
 .privacy.off { background: #f1f5f9; border-color: #cbd5e1; color: #475569; }
 .privacy svg { color: var(--blue); }
@@ -163,6 +165,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   background: var(--blue-soft); color: #1d4ed8; font-size: 11px; font-weight: 700;
 }
 .theme-switch:hover { background: #dbeafe; }
+.theme-switch.off { background: #f1f5f9; border-color: #cbd5e1; color: #475569; }
+.theme-switch.off:hover { background: #e2e8f0; }
+.settings-error {
+  font-size: 11px; font-weight: 600; color: #dc2626; padding: 2px 4px;
+}
 .shortcuts {
   display: flex; flex-direction: column; gap: 4px; padding-top: 6px;
   border-top: 1px solid rgba(20, 33, 61, 0.1);
@@ -227,6 +234,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 }
 .card.theme-dark .btn-secondary:hover,
 .card.theme-dark .theme-switch:hover { background: rgba(37, 99, 235, 0.24); color: #f1f5f9; }
+.card.theme-dark .theme-switch.off {
+  background: #1e293b; border-color: #475569; color: #cbd5e1;
+}
+.card.theme-dark .theme-switch.off:hover { background: #334155; }
+.card.theme-dark .settings-error {
+  color: #f87171;
+}
 .card.theme-dark .popover {
   background: #1e293b; border-color: rgba(148, 163, 184, 0.28);
   box-shadow: 0 8px 22px rgba(2, 6, 23, 0.6); color: #f1f5f9;

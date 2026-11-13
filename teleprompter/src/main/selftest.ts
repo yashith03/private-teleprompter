@@ -270,7 +270,7 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
         out,
         bar: document.querySelector('.bar').getBoundingClientRect().height,
         tb: document.querySelector('.toolbar').getBoundingClientRect().height,
-        pill: document.querySelector('[data-testid="privacy-toggle"]').getBoundingClientRect().height,
+        pill: document.querySelector('[data-testid="privacy-badge-container"]').getBoundingClientRect().height,
         sw: document.documentElement.scrollWidth,
         cw: document.documentElement.clientWidth,
         pop: pop.hidden ? true : inside(pop.getBoundingClientRect())
@@ -283,11 +283,48 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
     await sleep(150);
     lay = await layout();
     check('min size: settings popover fits inside card', lay.pop, JSON.stringify(lay));
-    await click(win, 'settings');
 
-    // Toggle privacy Off, reopen, confirm it persisted and is applied.
+    // Badge is read-only text: clicking does nothing, Tab skips it, cursor is default
+    const badgeTag = await js<string>(win, `document.querySelector('[data-testid="privacy-badge-container"]').tagName.toLowerCase()`);
+    const badgeCursor = await js<string>(win, `getComputedStyle(document.querySelector('[data-testid="privacy-badge-container"]')).cursor`);
+    const badgeBeforeClick = await js<string>(win, `document.querySelector('[data-testid="privacy-badge"]').textContent`);
+    await click(win, 'privacy-badge-container');
+    await sleep(100);
+    const badgeAfterClick = await js<string>(win, `document.querySelector('[data-testid="privacy-badge"]').textContent`);
+    const badgeTabSkipped = await js<boolean>(win, `(() => {
+      const el = document.querySelector('[data-testid="privacy-badge-container"]');
+      return el.tabIndex === -1 && !el.matches('button, a, input, select, textarea');
+    })()`);
+    check('privacy badge: read-only text, normal arrow cursor, click does nothing, tab skips it',
+      badgeTag === 'div' && badgeCursor === 'default' && badgeBeforeClick === badgeAfterClick && badgeTabSkipped,
+      JSON.stringify({ badgeTag, badgeCursor, badgeBeforeClick, badgeAfterClick, badgeTabSkipped }));
+
+    // Toggle privacy via Settings switch: OFF -> ON -> OFF
+    // Currently privacy is ON; toggle to OFF
     await click(win, 'privacy-toggle');
-    await sleep(200);
+    await sleep(150);
+    const badgeOff = await js<string>(win, `document.querySelector('[data-testid="privacy-badge"]').textContent`);
+    const switchOff = await js<string>(win, `document.querySelector('[data-testid="privacy-toggle"]').textContent.trim()`);
+    // Toggle to ON
+    await click(win, 'privacy-toggle');
+    await sleep(150);
+    const badgeOn = await js<string>(win, `document.querySelector('[data-testid="privacy-badge"]').textContent`);
+    const switchOn = await js<string>(win, `document.querySelector('[data-testid="privacy-toggle"]').textContent.trim()`);
+    // Toggle back to OFF
+    await click(win, 'privacy-toggle');
+    await sleep(150);
+    const badgeFinalOff = await js<string>(win, `document.querySelector('[data-testid="privacy-badge"]').textContent`);
+    const switchFinalOff = await js<string>(win, `document.querySelector('[data-testid="privacy-toggle"]').textContent.trim()`);
+    check('privacy switch in settings: cycles OFF -> ON -> OFF and updates badge synchronously',
+      /OFF/.test(badgeOff) && switchOff === 'OFF' &&
+      /ON/.test(badgeOn) && switchOn === 'ON' &&
+      /OFF/.test(badgeFinalOff) && switchFinalOff === 'OFF',
+      JSON.stringify({ badgeOff, switchOff, badgeOn, switchOn, badgeFinalOff, switchFinalOff }));
+
+    await click(win, 'settings');
+    await sleep(150);
+
+    // Reopen, confirm privacy OFF persisted and is applied.
     ctx.store.flush();
     ctx.eventLog.length = 0;
     win = ctx.reopen();
@@ -655,34 +692,49 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
       persistedTheme === 'dark',
       JSON.stringify({ initialTheme, darkState, popFits: popFitsWithThemeRow.pop, persistedTheme }));
 
-    // --- Minimize & restore: taskbar reachable, preserves scroll line, paused state, theme, and Private notes ---
+    // --- Minimize & restore: taskbar reachable only when minimized, preserves scroll line, paused state, theme, and Private notes ---
+    await click(win, 'settings');
+    await sleep(150);
     await click(win, 'privacy-toggle'); // turn Private notes ON (since previous privacy-off check set it false)
+    await sleep(150);
+    await click(win, 'settings');
     await sleep(150);
     await js(win, `document.querySelector('[data-testid="reader"]').scrollTop = 420`);
     await sleep(120);
     const topBeforeMin = await scrollTop(win);
     ctx.eventLog.length = 0;
-    await click(win, 'minimize');
-    await sleep(300);
-    const minimizedOk = win.isMinimized() && !win.isDestroyed() && ctx.eventLog.includes('minimize');
-    win.restore();
-    await sleep(300);
+
+    // Check taskbar entry status before minimize (should be hidden on launch/unminimized)
+    // Note: Electron does not have a getSkipTaskbar() getter, so we verify events, state, and repeat 3 times
+    let cyclesOk = true;
+    for (let c = 0; c < 3; c++) {
+      ctx.eventLog.length = 0;
+      await click(win, 'minimize');
+      await sleep(300);
+      const isMin = win.isMinimized() && !win.isDestroyed();
+      win.restore();
+      await sleep(300);
+      const isRestored = !win.isMinimized();
+      if (!isMin || !isRestored || !ctx.eventLog.includes('minimize') || !ctx.eventLog.includes('restore')) {
+        cyclesOk = false;
+      }
+    }
+
     const afterRestore = await js<{ top: number; btn: string; theme: string; badge: string }>(win, `({
       top: document.querySelector('[data-testid="reader"]').scrollTop,
       btn: document.querySelector('[data-testid="toggle"]').textContent.trim(),
       theme: document.querySelector('.card').dataset.theme,
       badge: document.querySelector('[data-testid="privacy-badge"]').textContent
     })`);
-    check('minimize & restore: taskbar reachable, keeps scroll line, paused state, dark theme, and Private notes',
-      minimizedOk &&
-      !win.isMinimized() &&
+    check('minimize & restore: taskbar reachable, keeps scroll line, paused state, dark theme, and Private notes across 3 cycles',
+      cyclesOk &&
       Math.abs(afterRestore.top - topBeforeMin) < 2 &&
       /Start/.test(afterRestore.btn) &&
       afterRestore.theme === 'dark' &&
       /ON/.test(afterRestore.badge) &&
       ctx.eventLog.includes('restore') &&
       ctx.eventLog.includes('protect:true'),
-      JSON.stringify({ minimizedOk, topBeforeMin, afterRestore, log: ctx.eventLog }));
+      JSON.stringify({ cyclesOk, topBeforeMin, afterRestore, log: ctx.eventLog }));
 
     // --- Toolbar overlap fix, frosted surface, and large-font bottom reachability at min size in Dark & Light ---
     const longLargeScript = [

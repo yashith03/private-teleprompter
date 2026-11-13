@@ -3,6 +3,7 @@ import path from 'node:path';
 import { SettingsStore } from './settingsStore';
 import type { Settings, ShortcutAction, ShortcutBindingStatus } from '../shared/types';
 import { runSelfTest } from './selftest';
+import { applyWindowsTaskbarPreviewProtection } from './windowsPreview';
 
 const SELFTEST = process.env.TELEPROMPTER_SELFTEST === '1';
 if (SELFTEST) {
@@ -117,7 +118,8 @@ export function createOverlay(): BrowserWindow {
     }
   });
 
-  win.setSkipTaskbar(false);
+  // Hide the taskbar entry on launch before the overlay first appears.
+  win.setSkipTaskbar(true);
   applyPrivateNotes(win, s.privateNotes);
   win.setAlwaysOnTop(true, 'screen-saver');
 
@@ -128,8 +130,18 @@ export function createOverlay(): BrowserWindow {
     eventLog.push('show');
     win.show();
     win.setContentProtection(store.get().privateNotes);
+    // Apply DWM preview protection (disallow Peek, exclude from Peek, iconic thumbnail/preview)
+    applyWindowsTaskbarPreviewProtection(win);
+  });
+  win.on('minimize', () => {
+    // Show taskbar entry when minimized so user can restore it
+    win.setSkipTaskbar(false);
+    applyWindowsTaskbarPreviewProtection(win);
+    eventLog.push('minimize-event');
   });
   win.on('restore', () => {
+    // Hide taskbar entry on restore; restore same window and preserve settings
+    win.setSkipTaskbar(true);
     win.setAlwaysOnTop(true, 'screen-saver');
     applyPrivateNotes(win, store.get().privateNotes);
     eventLog.push('restore');
@@ -191,6 +203,7 @@ function registerIpc(): void {
     if (!trusted(e)) throw new Error('untrusted sender');
     if (overlay && !overlay.isDestroyed()) {
       overlay.setSkipTaskbar(false);
+      applyWindowsTaskbarPreviewProtection(overlay);
       overlay.minimize();
       eventLog.push('minimize');
     }

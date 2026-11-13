@@ -51,6 +51,8 @@ export function App() {
   } | null>(null);
   const handledPointerUpRef = useRef(false);
   const [progress, setProgress] = useState<SlideProgressState>({ activeIndex: -1, fills: [] });
+  const [privacyError, setPrivacyError] = useState<string | null>(null);
+  const [privacyPending, setPrivacyPending] = useState(false);
 
   const parsedSlides = useMemo(() => parseSlides(s?.script ?? ''), [s?.script]);
 
@@ -396,6 +398,25 @@ export function App() {
   };
   const onGripUp = () => { gripStart.current = null; };
 
+  const onTogglePrivacy = useCallback(async () => {
+    if (!s || privacyPending) return;
+    setPrivacyPending(true);
+    setPrivacyError(null);
+    const targetState = !s.privateNotes;
+    try {
+      const next = await window.teleprompter.setPrivateNotes(targetState);
+      if (next && typeof next.privateNotes === 'boolean') {
+        setS((cur) => (cur ? { ...cur, privateNotes: next.privateNotes } : next));
+      } else {
+        setPrivacyError('Could not update Private notes.');
+      }
+    } catch {
+      setPrivacyError('Could not update Private notes.');
+    } finally {
+      setPrivacyPending(false);
+    }
+  }, [s, privacyPending]);
+
   if (!s) return <div className="loading">Loading...</div>;
 
   const restart = () => {
@@ -411,8 +432,8 @@ export function App() {
     : 'Ctrl+Space / Space';
 
   const privacyLabel = s.privateNotes
-    ? 'Private notes on: hidden from supported full-display capture. Click to turn off.'
-    : 'Private notes off: visible in screen sharing and recordings. Click to turn on.';
+    ? 'Private notes on: hidden from supported full-display capture.'
+    : 'Private notes off: visible in screen sharing and recordings.';
 
   const theme = s.theme === 'dark' ? 'dark' : 'light';
   const slideCount = parsedSlides.sections.length;
@@ -428,19 +449,15 @@ export function App() {
         style={{ '--panel-alpha': s.opacity } as CSSProperties}
       >
         <header className="bar">
-          <button
-            type="button"
-            role="switch"
-            aria-checked={s.privateNotes}
-            aria-label="Private notes"
+          <div
             title={privacyLabel}
-            data-testid="privacy-toggle"
+            data-testid="privacy-badge-container"
             className={`privacy ${s.privateNotes ? 'on' : 'off'}`}
-            onClick={() => void window.teleprompter.setPrivateNotes(!s.privateNotes).then(setS)}
+            aria-live="polite"
           >
             <ShieldIcon on={s.privateNotes} />
             <span data-testid="privacy-badge">Private notes: {s.privateNotes ? 'ON' : 'OFF'}</span>
-          </button>
+          </div>
           <span className="spacer" />
           <button
             type="button"
@@ -679,6 +696,27 @@ export function App() {
               aria-label="Background opacity" title="Background opacity (script text stays fully opaque)"
               onChange={(e) => change({ opacity: Number(e.target.value) })} />
           </label>
+          <div className="row">
+            <span>Private notes</span>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={s.privateNotes}
+              aria-label="Private notes"
+              title="Toggle Private notes protection"
+              data-testid="privacy-toggle"
+              className={`theme-switch ${s.privateNotes ? 'on' : 'off'}`}
+              disabled={privacyPending}
+              onClick={() => void onTogglePrivacy()}
+            >
+              {s.privateNotes ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          {privacyError && (
+            <div className="settings-error" data-testid="privacy-error" role="alert">
+              {privacyError}
+            </div>
+          )}
           <div className="row">
             <span>Theme</span>
             <button

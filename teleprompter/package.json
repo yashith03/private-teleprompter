@@ -39,11 +39,15 @@
     "files": ["dist/**/*", "package.json"],
     "asar": true,
     "win": {
-      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "target": [
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "zip", "arch": ["x64"] }
+      ],
       "icon": "build/icon.ico",
-      "artifactName": "Private-Teleprompter-Setup-${version}.exe"
+      "artifactName": "${productName}-${version}-${os}-${arch}.${ext}"
     },
     "nsis": {
+      "artifactName": "Private-Teleprompter-Setup-${version}.exe",
       "oneClick": true,
       "perMachine": false,
       "createDesktopShortcut": true,

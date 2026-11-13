@@ -1,4 +1,4 @@
-// Builds the app and packages it as a Windows x64 NSIS installer.
+// Builds the app and packages it as a Windows x64 NSIS installer and runnable ZIP.
 // Runs every tool through the current Node binary (process.execPath) and prepends its folder to PATH
 // for child processes only, so it works even when npm/node are not on the Windows PATH
 // (avoids the nested "npm run" lookup failure) and needs no permanent PATH change.
@@ -28,7 +28,21 @@ function run(label, script, args = []) {
 run('icon', 'scripts/make-icon.mjs');
 run('renderer build', 'node_modules/vite/bin/vite.js', ['build']);
 run('main/preload build', 'node_modules/typescript/bin/tsc', ['-p', 'tsconfig.main.json']);
-run('installer', 'node_modules/electron-builder/cli.js', ['--win', 'nsis', '--x64', '--publish', 'never']);
+
+// Copy Windows helper assets to dist
+const distWin = path.join(root, 'dist', 'main', 'windows');
+const srcWin = path.join(root, 'src', 'main', 'windows');
+fs.mkdirSync(distWin, { recursive: true });
+if (fs.existsSync(path.join(srcWin, 'dwmHelper.exe'))) {
+  fs.copyFileSync(path.join(srcWin, 'dwmHelper.exe'), path.join(distWin, 'dwmHelper.exe'));
+}
+if (fs.existsSync(path.join(srcWin, 'logo.png'))) {
+  fs.copyFileSync(path.join(srcWin, 'logo.png'), path.join(distWin, 'logo.png'));
+}
+
+run('installer and zip', 'node_modules/electron-builder/cli.js', ['--win', 'nsis', 'zip', '--x64', '--publish', 'never']);
 
 const version = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf-8')).version;
-console.log(`\n[package] done: ${path.join(root, 'release', `Private-Teleprompter-Setup-${version}.exe`)}`);
+console.log(`\n[package] done:`);
+console.log(`  Installer: ${path.join(root, 'release', `Private-Teleprompter-Setup-${version}.exe`)}`);
+console.log(`  Runnable ZIP: ${path.join(root, 'release', `Private Teleprompter-${version}-win-x64.zip`)}`);

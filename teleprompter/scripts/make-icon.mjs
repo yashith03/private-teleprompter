@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -123,4 +124,19 @@ images.forEach((img, i) => {
 });
 fs.writeFileSync(path.join(outDir, 'icon.ico'), Buffer.concat([dir, ...images.map((i) => i.data)]));
 fs.writeFileSync(path.join(outDir, 'icon.png'), encodePng(256, images[images.length - 1].rgba));
+
+// Also copy icon.png and compile dwmHelper.exe if on Windows
+const winDir = path.join(root, 'src', 'main', 'windows');
+fs.mkdirSync(winDir, { recursive: true });
+fs.copyFileSync(path.join(outDir, 'icon.png'), path.join(winDir, 'logo.png'));
+
+if (process.platform === 'win32') {
+  const csc = 'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe';
+  const csFile = path.join(outDir, 'dwmHelper.cs');
+  const exeOut = path.join(winDir, 'dwmHelper.exe');
+  if (fs.existsSync(csc) && fs.existsSync(csFile)) {
+    spawnSync(csc, ['/nologo', '/target:winexe', `/out:${exeOut}`, '/r:System.Drawing.dll', csFile], { stdio: 'ignore' });
+  }
+}
+
 console.log(`icon: wrote build/icon.ico (${SIZES.join(', ')}) and build/icon.png`);
