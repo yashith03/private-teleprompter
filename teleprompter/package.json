@@ -1,0 +1,59 @@
+{
+  "name": "private-teleprompter",
+  "version": "0.1.0",
+  "description": "Offline teleprompter overlay for Windows 11 with optional capture exclusion (Private notes).",
+  "author": "Private Teleprompter",
+  "main": "dist/main/main.js",
+  "private": true,
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.main.json --noEmit && tsc -p tsconfig.renderer.json --noEmit",
+    "build:renderer": "vite build",
+    "build:main": "tsc -p tsconfig.main.json",
+    "build": "npm run build:renderer && npm run build:main",
+    "start": "npm run build && electron .",
+    "dev": "concurrently -k \"vite\" \"wait-on tcp:5173 && npm run build:main && cross-env VITE_DEV_URL=http://localhost:5173 electron .\"",
+    "selftest": "npm run build && cross-env TELEPROMPTER_SELFTEST=1 electron .",
+    "icon": "node scripts/make-icon.mjs",
+    "dist": "node scripts/package.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.0.0",
+    "cross-env": "^7.0.3",
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "typescript": "^5.6.0",
+    "vite": "^6.0.0",
+    "wait-on": "^8.0.0"
+  },
+  "build": {
+    "appId": "com.privateteleprompter.app",
+    "productName": "Private Teleprompter",
+    "copyright": "Private Teleprompter",
+    "directories": { "output": "release", "buildResources": "build" },
+    "files": ["dist/**/*", "package.json"],
+    "asar": true,
+    "win": {
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "icon": "build/icon.ico",
+      "artifactName": "Private-Teleprompter-Setup-${version}.exe"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Private Teleprompter",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}
