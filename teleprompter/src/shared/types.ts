@@ -1,5 +1,11 @@
 export type ThemeMode = 'light' | 'dark';
 
+export interface ScriptShortcuts {
+  toggleScroll: string;
+  stepUp: string;
+  stepDown: string;
+}
+
 export interface Settings {
   script: string;
   /** "Private notes": when true the overlay is excluded from supported screen capture. */
@@ -10,15 +16,25 @@ export interface Settings {
   /** Window opacity 0.3 - 1. */
   opacity: number;
   theme: ThemeMode;
+  /** When true, script control shortcuts are registered globally while the Script reader is active. */
+  globalScriptControls: boolean;
+  shortcuts: ScriptShortcuts;
 }
 
 export type ShortcutAction = 'toggle-scroll' | 'step-up' | 'step-down';
 
 export interface ShortcutBindingStatus {
   action: ShortcutAction;
-  accelerator: 'Ctrl+Space' | 'Ctrl+Up' | 'Ctrl+Down';
+  accelerator: string;
   description: string;
   registered: boolean;
+}
+
+export interface ShortcutUpdateResult {
+  ok: boolean;
+  error?: string;
+  settings: Settings;
+  status: ShortcutBindingStatus[];
 }
 
 export type AiProviderId = 'gemini' | 'groq' | 'nvidia' | 'custom';
@@ -125,9 +141,16 @@ export interface AiSendMessageInput {
   history?: Array<{ role: 'user' | 'assistant'; text: string }>;
 }
 
+export interface GlossaryTerm {
+  id: string;
+  canonical: string;
+  aliases: string[];
+}
+
 export interface QaPair {
   id: string;
   question: string;
+  alternatives?: string[];
   answer: string;
   reference?: string;
 }
@@ -141,6 +164,7 @@ export interface QaKnowledgeBase {
   researchNotes: string;
   approvedPairs: QaPair[];
   answerInstructions: string;
+  glossary: GlossaryTerm[];
 }
 
 export type QaKnowledgePatch = Partial<QaKnowledgeBase>;
@@ -153,10 +177,12 @@ export interface QaSourceRef {
 
 export type SttProviderId = 'whisper' | 'deepgram';
 export type DeepgramModelId = 'flux-general-en' | 'nova-3';
+export type SttAudioSource = 'mic' | 'system';
 
 export interface SttConfig {
   provider: SttProviderId;
   deepgramModel: DeepgramModelId;
+  audioSource: SttAudioSource;
   language: string;
   modelPath: string;
   binaryPath: string;
@@ -210,6 +236,9 @@ export interface TeleprompterApi {
   reopenOverlay(): Promise<void>;
   resizeTo(width: number, height: number): void;
   getShortcuts(): Promise<ShortcutBindingStatus[]>;
+  setScriptReaderActive(active: boolean): Promise<ShortcutBindingStatus[]>;
+  updateShortcutBinding(action: ShortcutAction, accelerator: string): Promise<ShortcutUpdateResult>;
+  resetShortcutBindings(): Promise<{ settings: Settings; status: ShortcutBindingStatus[] }>;
   onShortcutAction(cb: (action: ShortcutAction) => void): () => void;
   onShortcutStatus(cb: (status: ShortcutBindingStatus[]) => void): () => void;
   getAiConfig(): Promise<AiPublicConfig>;

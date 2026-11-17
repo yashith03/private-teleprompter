@@ -3,6 +3,7 @@ import path from 'node:path';
 import { parseSlideHeadingLine, parseSlides } from '../shared/slides';
 import {
   DEFAULT_ANSWER_INSTRUCTIONS,
+  type GlossaryTerm,
   type QaKnowledgeBase,
   type QaKnowledgePatch,
   type QaPair,
@@ -125,16 +126,17 @@ function expandQueryTokensWithFuzzy(
 
   return raws.map((rw) => {
     const stemmed = stemToken(rw);
-    if (knownStems.has(stemmed) || rw.length < 5) {
+    // Avoid broad autocorrection of short technical terms (< 6 chars).
+    if (knownStems.has(stemmed) || rw.length < 6) {
       return stemmed;
     }
 
-    const maxDist = rw.length >= 10 ? 3 : rw.length >= 7 ? 2 : 1;
+    const maxDist = rw.length >= 11 ? 3 : rw.length >= 9 ? 2 : 1;
     let bestCand: string | null = null;
     let bestDist = maxDist + 1;
 
     for (const cand of candidates) {
-      if (cand.length < 4 || cand[0] !== rw[0]) continue;
+      if (cand.length < 5 || cand[0] !== rw[0]) continue;
       if (Math.abs(cand.length - rw.length) > maxDist) continue;
       const dist = damerauLevenshtein(rw, cand, maxDist);
       if (dist <= maxDist && dist < bestDist) {
@@ -148,55 +150,117 @@ function expandQueryTokensWithFuzzy(
   });
 }
 
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export function applyGlossary(text: string, glossary: GlossaryTerm[] = []): string {
+  if (!text.trim() || glossary.length === 0) return text;
+  const rules: Array<{ alias: string; canonical: string }> = [];
+  for (const entry of glossary) {
+    const canonical = entry.canonical.trim();
+    if (!canonical) continue;
+    for (const rawAlias of entry.aliases) {
+      const alias = rawAlias.trim();
+      if (!alias || alias.toLowerCase() === canonical.toLowerCase()) continue;
+      rules.push({ alias, canonical });
+    }
+  }
+  if (rules.length === 0) return text;
+
+  // Prefer the longest alias first so multi-word phrases win over shorter sub-aliases.
+  rules.sort((a, b) => b.alias.length - a.alias.length);
+
+  const canonicalByLower = new Map<string, string>();
+  for (const r of rules) {
+    const key = r.alias.toLowerCase();
+    if (!canonicalByLower.has(key)) canonicalByLower.set(key, r.canonical);
+  }
+
+  const pattern = new RegExp(
+    `(?<![a-z0-9])(?:${rules.map((r) => escapeRegExp(r.alias)).join('|')})(?![a-z0-9])`,
+    'gi'
+  );
+  return text.replace(pattern, (matched) => canonicalByLower.get(matched.toLowerCase()) ?? matched);
+}
+
 function normalizeExact(text: string): string {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 }
 
-export function findApprovedMatch(question: string, pairs: QaPair[]): QaPair | null {
-  const qNorm = normalizeExact(question);
+export function findApprovedMatch(
+  question: string,
+  pairs: QaPair[],
+  glossary: GlossaryTerm[] = []
+): QaPair | null {
+  const normalizedQuestion = applyGlossary(question, glossary);
+  const qNorm = normalizeExact(normalizedQuestion);
   if (!qNorm || pairs.length === 0) return null;
 
   const knownStems = new Set<string>();
   const rawVocab = new Set<string>();
-  for (const pair of pairs) {
-    if (!pair.question.trim() || !pair.answer.trim()) continue;
-    for (const rw of rawTokens(pair.question)) {
-      rawVocab.add(rw);
-      knownStems.add(stemToken(rw));
+  const validPairs = pairs.filter((p) => p.question.trim() && p.answer.trim());
+  for (const pair of validPairs) {
+    const phrases = [pair.question, ...(pair.alternatives ?? [])];
+    for (const phrase of phrases) {
+      for (const rw of rawTokens(applyGlossary(phrase, glossary))) {
+        rawVocab.add(rw);
+        knownStems.add(stemToken(rw));
+      }
     }
   }
 
-  const qTokens = expandQueryTokensWithFuzzy(question, knownStems, rawVocab);
+  const qTokens = expandQueryTokensWithFuzzy(normalizedQuestion, knownStems, rawVocab);
   const qSet = new Set(qTokens);
 
-  let best: { pair: QaPair; score: number } | null = null;
-  for (const pair of pairs) {
-    if (!pair.question.trim() || !pair.answer.trim()) continue;
-    if (normalizeExact(pair.question) === qNorm) {
-      return pair;
+  const pairScores: Array<{ pair: QaPair; score: number }> = [];
+  for (const pair of validPairs) {
+    const candidates = [pair.question, ...(pair.alternatives ?? [])]
+      .map((c) => applyGlossary(c, glossary).trim())
+      .filter(Boolean);
+
+    let pairBest = 0;
+    for (const cand of candidates) {
+      if (normalizeExact(cand) === qNorm) {
+        pairBest = 1;
+        break;
+      }
+
+      const pTokens = tokenize(cand);
+      const pSet = new Set(pTokens);
+      if (qSet.size === 0 || pSet.size === 0) continue;
+
+      let overlap = 0;
+      for (const tok of qSet) {
+        if (pSet.has(tok)) overlap += 1;
+      }
+      if (overlap === 0) continue;
+
+      const union = new Set([...qSet, ...pSet]).size;
+      const jaccard = overlap / union;
+      const pairContain = overlap / pSet.size;
+      const score = 0.6 * jaccard + 0.4 * pairContain;
+
+      if (jaccard >= 0.65 && pairContain >= 0.65 && score >= 0.70 && score > pairBest) {
+        pairBest = score;
+      }
     }
 
-    const pTokens = tokenize(pair.question);
-    const pSet = new Set(pTokens);
-    if (qSet.size === 0 || pSet.size === 0) continue;
-
-    let overlap = 0;
-    for (const tok of qSet) {
-      if (pSet.has(tok)) overlap += 1;
-    }
-    if (overlap === 0) continue;
-
-    const union = new Set([...qSet, ...pSet]).size;
-    const jaccard = overlap / union;
-    const minContain = overlap / Math.min(qSet.size, pSet.size);
-    const score = 0.6 * jaccard + 0.4 * minContain;
-
-    if (score >= 0.62 && (!best || score > best.score)) {
-      best = { pair, score };
+    if (pairBest > 0) {
+      pairScores.push({ pair, score: pairBest });
     }
   }
 
-  return best ? best.pair : null;
+  if (pairScores.length === 0) return null;
+  pairScores.sort((a, b) => b.score - a.score);
+
+  const top = pairScores[0];
+  const second = pairScores[1];
+  // If intent is ambiguous between two distinct approved answers, fall back to slide retrieval.
+  if (second && top.score < 0.98 && top.score - second.score < 0.05) {
+    return null;
+  }
+  return top.pair;
 }
 
 interface CandidateChunk {
@@ -317,7 +381,8 @@ export function retrieveRelevantExcerpts(
   kb: QaKnowledgeBase,
   maxExcerpts = 4
 ): QaSourceRef[] {
-  if (rawTokens(question).length === 0) return [];
+  const normalizedQuestion = applyGlossary(question, kb.glossary);
+  if (rawTokens(normalizedQuestion).length === 0) return [];
 
   const chunks = buildChunks(kb);
   if (chunks.length === 0) return [];
@@ -335,7 +400,7 @@ export function retrieveRelevantExcerpts(
     }
   }
 
-  const qTokens = expandQueryTokensWithFuzzy(question, new Set(df.keys()), rawVocab);
+  const qTokens = expandQueryTokensWithFuzzy(normalizedQuestion, new Set(df.keys()), rawVocab);
   if (qTokens.length === 0) return [];
   const qSet = new Set(qTokens);
 
@@ -400,6 +465,38 @@ export function verifyReferences(
   return { verifiedRefs, unverifiedRefs };
 }
 
+function sanitizeAlternatives(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const alts = raw
+    .filter((a): a is string => typeof a === 'string')
+    .map((a) => a.trim().slice(0, 1000))
+    .filter(Boolean)
+    .slice(0, 20);
+  return alts.length > 0 ? alts : undefined;
+}
+
+function sanitizeGlossary(raw: unknown): GlossaryTerm[] {
+  if (!Array.isArray(raw)) return [];
+  const out: GlossaryTerm[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const g = item as Partial<GlossaryTerm>;
+    if (typeof g.id !== 'string' || typeof g.canonical !== 'string') continue;
+    const canonical = g.canonical.trim().slice(0, 120);
+    if (!canonical) continue;
+    const aliases = Array.isArray(g.aliases)
+      ? g.aliases
+          .filter((a): a is string => typeof a === 'string')
+          .map((a) => a.trim().slice(0, 120))
+          .filter(Boolean)
+          .slice(0, 30)
+      : [];
+    out.push({ id: g.id.slice(0, 64), canonical, aliases });
+    if (out.length >= 200) break;
+  }
+  return out;
+}
+
 export class QaKnowledgeStore {
   private readonly filePath: string;
   private data: QaKnowledgeBase;
@@ -414,7 +511,8 @@ export class QaKnowledgeStore {
       slideSpeech: '',
       researchNotes: '',
       approvedPairs: [],
-      answerInstructions: DEFAULT_ANSWER_INSTRUCTIONS
+      answerInstructions: DEFAULT_ANSWER_INSTRUCTIONS,
+      glossary: []
     };
     try {
       const raw = JSON.parse(fs.readFileSync(this.filePath, 'utf8')) as Partial<QaKnowledgeBase>;
@@ -423,18 +521,30 @@ export class QaKnowledgeStore {
       const answerInstructions =
         typeof raw.answerInstructions === 'string' ? raw.answerInstructions : DEFAULT_ANSWER_INSTRUCTIONS;
       const approvedPairs = Array.isArray(raw.approvedPairs)
-        ? raw.approvedPairs.filter(
-            (p): p is QaPair =>
-              Boolean(
-                p &&
-                typeof p === 'object' &&
-                typeof p.id === 'string' &&
-                typeof p.question === 'string' &&
-                typeof p.answer === 'string'
-              )
-          )
+        ? raw.approvedPairs
+            .filter(
+              (p): p is QaPair =>
+                Boolean(
+                  p &&
+                  typeof p === 'object' &&
+                  typeof p.id === 'string' &&
+                  typeof p.question === 'string' &&
+                  typeof p.answer === 'string'
+                )
+            )
+            .map((p) => {
+              const alternatives = sanitizeAlternatives(p.alternatives);
+              return {
+                id: p.id,
+                question: p.question,
+                ...(alternatives ? { alternatives } : {}),
+                answer: p.answer,
+                ...(typeof p.reference === 'string' && p.reference.trim() ? { reference: p.reference } : {})
+              };
+            })
         : [];
-      return { slideSpeech, researchNotes, approvedPairs, answerInstructions };
+      const glossary = sanitizeGlossary(raw.glossary);
+      return { slideSpeech, researchNotes, approvedPairs, answerInstructions, glossary };
     } catch {
       return empty;
     }
@@ -449,8 +559,12 @@ export class QaKnowledgeStore {
     return {
       slideSpeech: this.data.slideSpeech,
       researchNotes: this.data.researchNotes,
-      approvedPairs: this.data.approvedPairs.map((p) => ({ ...p })),
-      answerInstructions: this.data.answerInstructions
+      approvedPairs: this.data.approvedPairs.map((p) => ({
+        ...p,
+        ...(p.alternatives ? { alternatives: [...p.alternatives] } : {})
+      })),
+      answerInstructions: this.data.answerInstructions,
+      glossary: this.data.glossary.map((g) => ({ ...g, aliases: [...g.aliases] }))
     };
   }
 
@@ -477,14 +591,21 @@ export class QaKnowledgeStore {
             )
         )
         .slice(0, 200)
-        .map((p) => ({
-          id: p.id.slice(0, 64),
-          question: p.question.trim().slice(0, 1000),
-          answer: p.answer.trim().slice(0, 4000),
-          ...(typeof p.reference === 'string' && p.reference.trim()
-            ? { reference: p.reference.trim().slice(0, 120) }
-            : {})
-        }));
+        .map((p) => {
+          const alternatives = sanitizeAlternatives(p.alternatives);
+          return {
+            id: p.id.slice(0, 64),
+            question: p.question.trim().slice(0, 1000),
+            ...(alternatives ? { alternatives } : {}),
+            answer: p.answer.trim().slice(0, 4000),
+            ...(typeof p.reference === 'string' && p.reference.trim()
+              ? { reference: p.reference.trim().slice(0, 120) }
+              : {})
+          };
+        });
+    }
+    if (Array.isArray(patch.glossary)) {
+      this.data.glossary = sanitizeGlossary(patch.glossary);
     }
     this.save();
     return this.get();

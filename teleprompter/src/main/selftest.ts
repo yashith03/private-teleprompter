@@ -47,7 +47,7 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
     await loaded(win);
 
     const longScript = Array.from({ length: 200 }, (_, i) => `Line ${i + 1} of the self-test script.`).join('\n\n');
-    await js(win, `window.teleprompter.updateSettings({ script: ${JSON.stringify(longScript)}, speed: 200, fontSize: 44, opacity: 0.8 })`);
+    await js(win, `window.teleprompter.updateSettings({ script: ${JSON.stringify(longScript)}, speed: 85, fontSize: 44, opacity: 0.8 })`);
     await js(win, `window.teleprompter.setPrivateNotes(false)`);
     await js(win, `window.teleprompter.setPrivateNotes(true)`);
     ctx.store.flush();
@@ -66,7 +66,34 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
       opacity: parseFloat(document.querySelector('.card').style.getPropertyValue('--panel-alpha'))
     })`);
     check('settings restore: font size', restored.fs === '44px', restored.fs);
-    check('settings restore: speed', restored.speed === '200', restored.speed);
+    check('settings restore: speed', restored.speed === '85', restored.speed);
+
+    const speedRangeCheck = await js<{ min: string; max: string; step: string; label85: string; label4: string }>(win, `(async () => {
+      const inp = document.querySelector('[data-testid="speed"]');
+      const label85 = document.querySelector('[data-testid="speed-value"]')?.textContent?.trim() ?? '';
+      await window.teleprompter.updateSettings({ speed: 4 });
+      const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      set.call(inp, '4');
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+      inp.dispatchEvent(new Event('change', { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 80));
+      const label4 = document.querySelector('[data-testid="speed-value"]')?.textContent?.trim() ?? '';
+      set.call(inp, '85');
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+      inp.dispatchEvent(new Event('change', { bubbles: true }));
+      await window.teleprompter.updateSettings({ speed: 85 });
+      await new Promise((r) => setTimeout(r, 250));
+      return { min: inp.min, max: inp.max, step: inp.step, label85, label4 };
+    })()`);
+    check(
+      'speed range 2-100 step 1 and numeric label',
+      speedRangeCheck.min === '2' &&
+        speedRangeCheck.max === '100' &&
+        speedRangeCheck.step === '1' &&
+        speedRangeCheck.label85 === '85' &&
+        speedRangeCheck.label4 === '4',
+      JSON.stringify(speedRangeCheck)
+    );
     check('settings restore: private notes badge ON', /ON/.test(restored.badge), restored.badge);
     check('settings restore: panel opacity (CSS only)', Math.abs(restored.opacity - 0.8) < 0.001, String(restored.opacity));
     check('window opacity untouched (text stays legible)', Math.abs(win.getOpacity() - 1) < 0.001, String(win.getOpacity()));
@@ -146,44 +173,74 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
     check('resume continues from paused position', r1 > p2 + 50, `${p2} -> ${r1}`);
     await click(win, 'toggle');
 
-    // Global shortcut registration & Alt-removal checks.
+    // Global shortcut registration & Alt/Ctrl+Space-removal checks.
     const bindings = await js<ShortcutBindingStatus[]>(win, `window.teleprompter.getShortcuts()`);
-    check('shortcuts: only 3 supported bindings exposed',
+    check('shortcuts: 3 global bindings exposed (Enter,Ctrl+Up,Ctrl+Down)',
       bindings.length === 3 &&
-      bindings.map((b) => b.accelerator).join(',') === 'Ctrl+Space,Ctrl+Up,Ctrl+Down' &&
+      bindings.map((b) => b.accelerator).join(',') === 'Enter,Ctrl+Up,Ctrl+Down' &&
       bindings.every((b) => b.registered),
       JSON.stringify(bindings.map((b) => `${b.accelerator}:${b.registered}`)));
-    check('shortcuts: old Ctrl+Alt+Up/Down not registered',
-      !globalShortcut.isRegistered('Control+Alt+Up') && !globalShortcut.isRegistered('Control+Alt+Down'));
+    check('shortcuts: old Ctrl+Space and Ctrl+Alt+Up/Down not registered',
+      !globalShortcut.isRegistered('Control+Space') &&
+      !globalShortcut.isRegistered('Control+Alt+Up') &&
+      !globalShortcut.isRegistered('Control+Alt+Down'));
 
-    // Ctrl+Space starts, pauses without reset, and resumes from paused position without stealing focus.
+    // Global toggle-scroll (Enter) starts, pauses without reset, and resumes without stealing focus.
     await click(win, 'restart');
     await sleep(100);
-    const otherApp = new BrowserWindow({ width: 160, height: 120, show: true });
+    const focusApp = new BrowserWindow({ width: 160, height: 120, show: true });
     await sleep(250);
-    const unfocusedBefore = !win.isFocused();
-    ctx.dispatchShortcutAction('toggle-scroll'); // start
+    const unfocusedForToggle = !win.isFocused();
+    ctx.dispatchShortcutAction('toggle-scroll'); // start while unfocused
     await sleep(700);
     const gs1 = await scrollTop(win);
-    const stillUnfocusedAfter = !win.isFocused();
-    otherApp.destroy();
-    check('Ctrl+Space starts auto-scroll without stealing focus',
-      unfocusedBefore && gs1 > 30 && stillUnfocusedAfter,
-      `unfocusedBefore=${unfocusedBefore} scrollTop=${gs1} stillUnfocusedAfter=${stillUnfocusedAfter}`);
-
-    ctx.dispatchShortcutAction('toggle-scroll'); // pause
+    const stillUnfocused1 = !win.isFocused();
+    ctx.dispatchShortcutAction('toggle-scroll'); // pause while unfocused
     await sleep(150);
     const gp1 = await scrollTop(win);
     await sleep(450);
     const gp2 = await scrollTop(win);
-    check('Ctrl+Space pauses without scroll reset', gp1 > 30 && Math.abs(gp2 - gp1) < 2, `${gp1} -> ${gp2}`);
-
-    ctx.dispatchShortcutAction('toggle-scroll'); // resume
+    ctx.dispatchShortcutAction('toggle-scroll'); // resume while unfocused
     await sleep(550);
     const gr1 = await scrollTop(win);
-    check('Ctrl+Space resumes from same paused position', gr1 > gp2 + 30, `${gp2} -> ${gr1}`);
-    ctx.dispatchShortcutAction('toggle-scroll'); // back to paused
+    ctx.dispatchShortcutAction('toggle-scroll'); // pause
     await sleep(100);
+    focusApp.destroy();
+    check('Global Enter (toggle-scroll) starts, pauses, and resumes without focus',
+      unfocusedForToggle && stillUnfocused1 && gs1 > 30 && gp1 > 30 && Math.abs(gp2 - gp1) < 2 && gr1 > gp2 + 30,
+      `unfocused=${unfocusedForToggle}/${stillUnfocused1} gs1=${gs1} gp=${gp1}->${gp2} gr1=${gr1}`);
+
+    // Turning Global Script Controls OFF unregisters global keys and keeps local Enter working.
+    await js(win, `window.teleprompter.updateSettings({ globalScriptControls: false })`);
+    await sleep(150);
+    const unregisteredWhenOff = !globalShortcut.isRegistered('Return') && !globalShortcut.isRegistered('Control+Up');
+    await click(win, 'restart');
+    await sleep(100);
+    await js(win, `window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }))`);
+    await sleep(600);
+    const localEnterStarted = (await scrollTop(win)) > 20;
+    await js(win, `window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'NumpadEnter', bubbles: true }))`);
+    await sleep(100);
+    await js(win, `window.teleprompter.updateSettings({ globalScriptControls: true })`);
+    await sleep(150);
+    const reRegisteredWhenOn = globalShortcut.isRegistered('Return');
+    check('Global Script Controls OFF releases global keys and keeps local Enter working',
+      unregisteredWhenOff && localEnterStarted && reRegisteredWhenOn,
+      JSON.stringify({ unregisteredWhenOff, localEnterStarted, reRegisteredWhenOn }));
+
+    // Ctrl+Up / Ctrl+Down still work when another app is focused without stealing focus.
+    const otherApp = new BrowserWindow({ width: 160, height: 120, show: true });
+    await sleep(250);
+    const unfocusedBefore = !win.isFocused();
+    const beforeUnfocusedStep = await scrollTop(win);
+    ctx.dispatchShortcutAction('step-down');
+    await sleep(120);
+    const afterUnfocusedStep = await scrollTop(win);
+    const stillUnfocusedAfter = !win.isFocused();
+    otherApp.destroy();
+    check('Ctrl+Down steps without stealing focus',
+      unfocusedBefore && Math.abs((afterUnfocusedStep - beforeUnfocusedStep) - 80) < 2 && stillUnfocusedAfter,
+      `unfocusedBefore=${unfocusedBefore} ${beforeUnfocusedStep}->${afterUnfocusedStep} stillUnfocusedAfter=${stillUnfocusedAfter}`);
 
     // Ctrl+Up / Ctrl+Down step consistently while paused and preserve paused state + clamp bounds.
     const pausedBase = await scrollTop(win);
@@ -217,53 +274,78 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
 
     // Ctrl+Down/Up preserve playing state when playing.
     await js(win, `document.querySelector('[data-testid="reader"]').scrollTop = 200`);
-    ctx.dispatchShortcutAction('toggle-scroll'); // playing
+    await click(win, 'toggle'); // playing
     await sleep(120);
     ctx.dispatchShortcutAction('step-down');
     await sleep(80);
     const playingStepped = await scrollTop(win);
     const togglePlaying = await js<string>(win, `document.querySelector('[data-testid="toggle"]').textContent`);
-    ctx.dispatchShortcutAction('toggle-scroll'); // pause
+    await click(win, 'toggle'); // pause
     await sleep(80);
     check('Ctrl+Down preserves playing state',
       playingStepped > 260 && /Pause/.test(togglePlaying), `scrollTop=${playingStepped} label=${togglePlaying}`);
 
-    // Local Ctrl+Space keydown does not double-trigger; editor Space does not toggle playback.
-    const beforeCtrlKey = await scrollTop(win);
-    await js(win, `window.dispatchEvent(new KeyboardEvent('keydown', { code: 'Space', ctrlKey: true, bubbles: true }))`);
+    // Space does not toggle playback; editor Enter and Settings Enter do not toggle playback.
+    const beforeSpaceKey = await scrollTop(win);
+    await js(win, `window.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', bubbles: true }))`);
     await sleep(120);
-    const afterCtrlKey = await scrollTop(win);
-    const labelAfterLocalCtrlSpace = await js<string>(win, `document.querySelector('[data-testid="toggle"]').textContent`);
+    const afterSpaceKey = await scrollTop(win);
+    const labelAfterSpace = await js<string>(win, `document.querySelector('[data-testid="toggle"]').textContent`);
     await click(win, 'edit');
     await sleep(100);
-    await js(win, `document.querySelector('[data-testid="editor"]').dispatchEvent(new KeyboardEvent('keydown', { code: 'Space', bubbles: true }))`);
+    await js(win, `document.querySelector('[data-testid="editor"]').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }))`);
     await sleep(100);
     const stillEditing = await js<boolean>(win, `!!document.querySelector('[data-testid="editor"]')`);
-    const labelAfterEditorSpace = await js<string>(win, `document.querySelector('[data-testid="toggle"]').textContent`);
+    const labelAfterEditorEnter = await js<string>(win, `document.querySelector('[data-testid="toggle"]').textContent`);
     await click(win, 'edit');
     await sleep(100);
-    check('local Ctrl+Space and editor Space do not hijack',
-      /Start/.test(labelAfterLocalCtrlSpace) && Math.abs(afterCtrlKey - beforeCtrlKey) < 2 &&
-      stillEditing && /Start/.test(labelAfterEditorSpace),
-      `ctrl=${beforeCtrlKey}->${afterCtrlKey} editing=${stillEditing} label=${labelAfterEditorSpace}`);
+    await click(win, 'settings');
+    await sleep(80);
+    await js(win, `window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }))`);
+    await sleep(80);
+    const labelAfterSettingsEnter = await js<string>(win, `document.querySelector('[data-testid="toggle"]').textContent`);
+    await click(win, 'settings');
+    await sleep(80);
+    check('Space, editor Enter, and Settings Enter do not hijack playback',
+      /Start/.test(labelAfterSpace) && Math.abs(afterSpaceKey - beforeSpaceKey) < 2 &&
+      stillEditing && /Start/.test(labelAfterEditorEnter) && /Start/.test(labelAfterSettingsEnter),
+      `space=${beforeSpaceKey}->${afterSpaceKey} editing=${stillEditing} editorLabel=${labelAfterEditorEnter} settingsLabel=${labelAfterSettingsEnter}`);
 
-    // Registration failure handling: marks Unavailable, does not fall back, toolbar Start button still works.
-    ctx.registerGlobalShortcuts((acc) => acc !== 'Control+Space');
-    await sleep(150);
-    const failedUi = await js<{ row: string; title: string; list: string }>(win, `({
-      row: document.querySelector('[data-testid="shortcut-toggle-scroll"]').textContent,
-      title: document.querySelector('[data-testid="toggle"]').title,
-      list: document.querySelector('[data-testid="shortcuts-list"]').textContent
-    })`);
+    // Registration failure handling: toolbar Start button still works; customizable shortcuts reject Space/duplicates, persist, and reset.
+    const shortcutCust = await js<{
+      spaceRejected: boolean;
+      dupRejected: boolean;
+      f8Ok: boolean;
+      hasButtonTitle: boolean;
+      list: string;
+    }>(win, `(async () => {
+      const spaceRes = await window.teleprompter.updateShortcutBinding('toggle-scroll', 'Space');
+      const dupRes = await window.teleprompter.updateShortcutBinding('toggle-scroll', 'Ctrl+Up');
+      const f8Res = await window.teleprompter.updateShortcutBinding('toggle-scroll', 'F8');
+      return {
+        spaceRejected: !spaceRes.ok && /Space/i.test(spaceRes.error || ''),
+        dupRejected: !dupRes.ok && /Already assigned/i.test(dupRes.error || ''),
+        f8Ok: f8Res.ok && f8Res.settings.shortcuts.toggleScroll === 'F8',
+        hasButtonTitle: [...document.querySelectorAll('button[title]')].length > 0,
+        list: document.querySelector('[data-testid="shortcuts-list"]').textContent
+      };
+    })()`);
     await click(win, 'toggle');
     await sleep(250);
     const uiBtnStillWorks = /Pause/.test(await js<string>(win, `document.querySelector('[data-testid="toggle"]').textContent`));
     await click(win, 'toggle');
-    ctx.registerGlobalShortcuts();
-    check('shortcut registration failure displays Unavailable and preserves Start/Pause button',
-      /Unavailable/i.test(failedUi.row) && /unavailable/i.test(failedUi.title) &&
-      !/Alt/i.test(failedUi.list) && uiBtnStillWorks,
-      JSON.stringify(failedUi));
+    await js(win, `window.teleprompter.resetShortcutBindings()`);
+    await sleep(100);
+    const afterReset = await js<ShortcutBindingStatus[]>(win, `window.teleprompter.getShortcuts()`);
+    check('customizable shortcuts reject Space/duplicates, update to F8, reset to defaults, and buttons have no title tooltips',
+      shortcutCust.spaceRejected &&
+      shortcutCust.dupRejected &&
+      shortcutCust.f8Ok &&
+      !shortcutCust.hasButtonTitle &&
+      !/Alt/i.test(shortcutCust.list) &&
+      uiBtnStillWorks &&
+      afterReset.map((b) => b.accelerator).join(',') === 'Enter,Ctrl+Up,Ctrl+Down',
+      JSON.stringify({ shortcutCust, afterReset: afterReset.map((b) => b.accelerator) }));
 
     // Smallest supported window: nothing clipped or wrapped awkwardly.
     const [minW, minH] = win.getMinimumSize();
@@ -460,9 +542,9 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
     check('slides UI: click segment 3 while paused jumps to Slide 3 and keeps paused state',
       jump3Ok, JSON.stringify(afterJump3));
 
-    // Ctrl+Space resumes from Slide 3 and auto-scroll reaches 100% on short final Slide 3.
+    // Start/Pause resumes from Slide 3 and auto-scroll reaches 100% on short final Slide 3.
     ctx.dispatchShortcutAction('toggle-scroll');
-    await sleep(1600);
+    await sleep(2600);
     const atEnd = await js<{ top: number; max: number; btn: string; fills: string[] }>(win, `(() => {
       const r = document.querySelector('[data-testid="reader"]');
       return {
@@ -782,7 +864,7 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
         readerOverflowY: string;
         toolbarBg: string;
         toolbarBorder: string;
-        toolbarBlur: string;
+        iconBtnBordersOk: boolean;
         toolbarOpacity: string;
         readerOpacity: string;
         lastLineVisible: boolean;
@@ -833,7 +915,9 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
           return { id, inBtn: !!hit && btn.contains(hit), inReader: !!hit && reader.contains(hit) };
         });
 
-        const blurVal = tStyle.backdropFilter || tStyle.webkitBackdropFilter || '';
+        const iconBtnBorders = ['restart', 'edit', 'settings'].map((id) =>
+          Number.parseFloat(getComputedStyle(document.querySelector('[data-testid="' + id + '"]')).borderTopWidth)
+        );
         return {
           theme: document.querySelector('.card').dataset.theme,
           separated: rRect.bottom <= tRect.top + 0.5,
@@ -841,32 +925,31 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
           readerOverflowY: rStyle.overflowY,
           toolbarBg: tStyle.backgroundColor,
           toolbarBorder: tStyle.borderTopWidth,
-          toolbarBlur: blurVal,
+          iconBtnBordersOk: iconBtnBorders.every((w) => w >= 0.5),
           toolbarOpacity: tStyle.opacity,
           readerOpacity: rStyle.opacity,
           lastLineVisible,
           hitsOk: hits.every((h) => h.inBtn && !h.inReader),
-          details: { rBottom: rRect.bottom, tTop: tRect.top, lastRect, hits, maxScroll }
+          details: { rBottom: rRect.bottom, tTop: tRect.top, lastRect, hits, maxScroll, iconBtnBorders }
         };
       })()`);
     };
 
     const darkMinLayout = await checkLayoutForTheme('dark');
     const lightMinLayout = await checkLayoutForTheme('light');
-    check('layout & reachability (420x260, 64px font, Dark & Light): frosted toolbar clips speech and keeps final line reachable',
+    check('layout & reachability (420x260, 64px font, Dark & Light): transparent toolbar with bordered buttons keeps final line reachable',
       [darkMinLayout, lightMinLayout].every((res) =>
         res.separated &&
         res.bodyOverflow === 'hidden' &&
         res.readerOverflowY === 'auto' &&
         Number.parseFloat(res.toolbarBorder) >= 0.5 &&
-        res.toolbarBlur.includes('blur') &&
+        res.toolbarBg === 'rgba(0, 0, 0, 0)' &&
+        res.iconBtnBordersOk &&
         res.toolbarOpacity === '1' &&
         res.readerOpacity === '1' &&
         res.lastLineVisible &&
         res.hitsOk
-      ) &&
-      /rgba?\(15,\s*23,\s*42/.test(darkMinLayout.toolbarBg) &&
-      /rgba?\(242,\s*247,\s*255/.test(lightMinLayout.toolbarBg),
+      ),
       JSON.stringify({ darkMinLayout, lightMinLayout }));
 
     // --- Reading mode cursor: default, user-select: none, drag without selection/window move, editor selection + copy/paste ---
@@ -1095,20 +1178,14 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
       // Restore valid loopback mock URL via Settings UI so React state + main store stay in sync
       await click(win, 'settings');
       await sleep(80);
-      await js(win, `(() => {
-        const prov = document.querySelector('[data-testid="ai-provider"]');
-        const setSel = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
-        setSel.call(prov, 'custom');
-        prov.dispatchEvent(new Event('change', { bubbles: true }));
-      })()`);
+      await click(win, 'ai-provider');
+      await sleep(40);
+      await click(win, 'ai-provider-option-custom');
       await sleep(80);
       const manualHiddenInitially = await js<boolean>(win, `!document.querySelector('[data-testid="ai-model-input"]')`);
-      await js(win, `(() => {
-        const modSel = document.querySelector('[data-testid="ai-model-select"]');
-        const setSel = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
-        setSel.call(modSel, '__manual__');
-        modSel.dispatchEvent(new Event('change', { bubbles: true }));
-      })()`);
+      await click(win, 'ai-model-select');
+      await sleep(40);
+      await click(win, 'ai-model-select-option-__manual__');
       await sleep(60);
       await js(win, `(() => {
         const urlInp = document.querySelector('[data-testid="ai-custom-url"]');
@@ -1180,7 +1257,6 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
         inp.dispatchEvent(new Event('input', { bubbles: true }));
         inp.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', bubbles: true }));
       })()`);
-      ctx.dispatchShortcutAction('toggle-scroll');
       ctx.dispatchShortcutAction('step-down');
       await sleep(100);
 
@@ -1579,6 +1655,86 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
           restoredState
         })
       );
+
+      // Verify System audio (Windows) source selector, getDisplayMedia loopback flow, video track cleanup, and stop cleanup.
+      await click(win, 'audio-source');
+      await sleep(120);
+      const menuOpen = await js<boolean>(win, `Boolean(document.querySelector('[data-testid="audio-source-option-system"]'))`);
+      await click(win, 'audio-source-option-system');
+      await sleep(200);
+      const sysCheck = await js<{
+        menuOpen: boolean;
+        defaultSource: string;
+        hasMicDeviceOnSys: boolean;
+        startBtnLabel: string;
+        displayMediaCalls: number;
+        videoStopped: number;
+        audioStoppedBeforeStop: number;
+        listeningOnSys: string;
+        audioStoppedAfterStop: number;
+        statusAfterStop: string;
+      }>(win, `(async () => {
+        const cfg0 = await window.teleprompter.getSttConfig();
+        let displayMediaCalls = 0;
+        let videoStopped = 0;
+        let audioStopped = 0;
+        const origGetDisplayMedia = navigator.mediaDevices.getDisplayMedia;
+        navigator.mediaDevices.getDisplayMedia = async () => {
+          displayMediaCalls += 1;
+          const vTrack = { kind: 'video', stop: () => { videoStopped += 1; } };
+          const aTrack = { kind: 'audio', stop: () => { audioStopped += 1; } };
+          const tracks = [vTrack, aTrack];
+          return {
+            getVideoTracks: () => tracks.filter((t) => t.kind === 'video'),
+            getAudioTracks: () => tracks.filter((t) => t.kind === 'audio'),
+            getTracks: () => [...tracks],
+            removeTrack: (t) => {
+              const i = tracks.indexOf(t);
+              if (i >= 0) tracks.splice(i, 1);
+            }
+          };
+        };
+        try {
+          const hasMicDeviceOnSys = Boolean(document.querySelector('[data-testid="mic-device"]'));
+          const startBtnLabel = document.querySelector('[data-testid="mic-start"]')?.textContent?.trim() ?? '';
+          document.querySelector('[data-testid="mic-start"]')?.click();
+          await new Promise((r) => setTimeout(r, 120));
+          const listeningOnSys = document.querySelector('[data-testid="mic-status"]')?.textContent?.trim() ?? '';
+          const audioStoppedBeforeStop = audioStopped;
+          document.querySelector('[data-testid="mic-stop"]')?.click();
+          await new Promise((r) => setTimeout(r, 80));
+          const statusAfterStop = document.querySelector('[data-testid="mic-status"]')?.textContent?.trim() ?? '';
+          await window.teleprompter.updateSttConfig({ audioSource: 'mic' });
+          await new Promise((r) => setTimeout(r, 80));
+          return {
+            menuOpen: ${menuOpen},
+            defaultSource: cfg0.audioSource,
+            hasMicDeviceOnSys,
+            startBtnLabel,
+            displayMediaCalls,
+            videoStopped,
+            audioStoppedBeforeStop,
+            listeningOnSys,
+            audioStoppedAfterStop: audioStopped,
+            statusAfterStop
+          };
+        } finally {
+          navigator.mediaDevices.getDisplayMedia = origGetDisplayMedia;
+        }
+      })()`);
+      check(
+        'System audio (Windows): selector, getDisplayMedia loopback, video track stop, and audio cleanup',
+        sysCheck.defaultSource === 'system' &&
+          !sysCheck.hasMicDeviceOnSys &&
+          sysCheck.startBtnLabel === 'Start audio' &&
+          sysCheck.displayMediaCalls === 1 &&
+          sysCheck.videoStopped === 1 &&
+          sysCheck.audioStoppedBeforeStop === 0 &&
+          sysCheck.listeningOnSys === 'Listening' &&
+          sysCheck.audioStoppedAfterStop === 1 &&
+          sysCheck.statusAfterStop === 'Mic Off',
+        JSON.stringify(sysCheck)
+      );
       console.log(`METRIC endOfQuestionToFirstAnswerMs=${endOfQuestionToFirstAnswerMs}`);
 
       // ── Deepgram Streaming STT (Flux & Nova-3) self-test ─────────────────
@@ -1667,12 +1823,9 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
         // 2) Switch to Deepgram in Settings UI -> shows "Audio is sent to Deepgram", save encrypted key
         await click(win, 'settings');
         await sleep(60);
-        await js(win, `(() => {
-          const sel = document.querySelector('[data-testid="stt-provider"]');
-          const setSel = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
-          setSel.call(sel, 'deepgram');
-          sel.dispatchEvent(new Event('change', { bubbles: true }));
-        })()`);
+        await click(win, 'stt-provider');
+        await sleep(40);
+        await click(win, 'stt-provider-option-deepgram');
         await sleep(60);
         const settingsNotice = await js<string>(win, `document.querySelector('[data-testid="stt-deepgram-notice"]')?.textContent?.trim() ?? ''`);
         await js(win, `(() => {
@@ -2061,7 +2214,7 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
         }>(win, `(() => {
           const sel = document.querySelector('[data-testid="ai-model-select"]');
           return {
-            firstOptVal: sel?.options?.[0]?.value ?? '',
+            firstOptVal: sel?.getAttribute('data-first-value') ?? '',
             hasRetiredBanner: Boolean(document.querySelector('[data-testid="ai-model-retired"]')),
             hasReplaceBtn: Boolean(document.querySelector('[data-testid="ai-model-replace-btn"]'))
           };

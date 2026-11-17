@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/test';
 import {
   launchTeleprompterApp,
+  selectCustomOption,
   startMockAiServer,
   startMockDeepgramServer
 } from './helpers';
@@ -14,12 +15,12 @@ test.describe('Microphone, Fake WAV Audio Capture & Listening Pipeline', () => {
     try {
       // Configure AI custom endpoint + Deepgram STT through Settings UI
       await app.page.getByTestId('settings').click();
-      await app.page.getByTestId('ai-provider').selectOption('custom');
+      await selectCustomOption(app.page, 'ai-provider', 'custom');
       await app.page.getByTestId('ai-custom-url').fill(aiMock.baseUrl);
       await app.page.getByTestId('ai-list-models').click();
-      await expect(app.page.getByTestId('ai-model-select')).toHaveValue('__auto__');
+      await expect(app.page.getByTestId('ai-model-select')).toHaveAttribute('data-value', '__auto__');
 
-      await app.page.getByTestId('stt-provider').selectOption('deepgram');
+      await selectCustomOption(app.page, 'stt-provider', 'deepgram');
       await expect(app.page.getByTestId('stt-deepgram-notice')).toContainText('Audio is sent to Deepgram');
       await app.page.getByTestId('stt-deepgram-key-input').fill('dg-e2e-audio-key');
       await app.page.getByTestId('stt-deepgram-key-save').click();

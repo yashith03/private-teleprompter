@@ -764,7 +764,7 @@ export class AiProviderService {
   ): string {
     const requestId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const kb = kbStore.get();
-    const approved = findApprovedMatch(input.question, kb.approvedPairs);
+    const approved = findApprovedMatch(input.question, kb.approvedPairs, kb.glossary);
     if (approved) {
       queueMicrotask(() => {
         const refSources: QaSourceRef[] = approved.reference

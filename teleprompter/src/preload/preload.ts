@@ -24,6 +24,9 @@ const api: TeleprompterApi = {
   reopenOverlay: () => ipcRenderer.invoke('window:reopen'),
   resizeTo: (width, height) => ipcRenderer.send('window:resize', width, height),
   getShortcuts: () => ipcRenderer.invoke('shortcuts:get'),
+  setScriptReaderActive: (active) => ipcRenderer.invoke('shortcuts:set-reader-active', active === true),
+  updateShortcutBinding: (action, accelerator) => ipcRenderer.invoke('shortcuts:update-binding', action, accelerator),
+  resetShortcutBindings: () => ipcRenderer.invoke('shortcuts:reset-bindings'),
   onShortcutAction: (cb) => {
     ipcRenderer.removeAllListeners('shortcut:action');
     const handler = (_e: IpcRendererEvent, action: unknown) => {

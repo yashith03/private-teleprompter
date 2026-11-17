@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 'react';
+import { CustomSelect } from './CustomSelect';
 import {
   AI_PROVIDER_PRESETS,
   DEFAULT_ANSWER_INSTRUCTIONS,
   type AiChatStreamEvent,
   type AiErrorKind,
   type AiPublicConfig,
+  type GlossaryTerm,
   type QaKnowledgeBase,
   type QaKnowledgePatch,
   type QaPair,
@@ -121,11 +123,15 @@ export function QaPanel({
     slideSpeech: '',
     researchNotes: '',
     approvedPairs: [],
-    answerInstructions: DEFAULT_ANSWER_INSTRUCTIONS
+    answerInstructions: DEFAULT_ANSWER_INSTRUCTIONS,
+    glossary: []
   });
   const [pairQ, setPairQ] = useState('');
+  const [pairAlts, setPairAlts] = useState('');
   const [pairA, setPairA] = useState('');
   const [pairRef, setPairRef] = useState('');
+  const [glossaryCanonical, setGlossaryCanonical] = useState('');
+  const [glossaryAliases, setGlossaryAliases] = useState('');
 
   // Mic / whisper.cpp state (raw audio recording is off by default)
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
@@ -419,21 +425,42 @@ export function QaPanel({
       setMicError(sttStatus?.reason || 'Whisper transcription model unavailable. Typed input remains usable.');
       return;
     }
-    if (!navigator.mediaDevices?.getUserMedia) {
+    const useSystemAudio = sttConfig?.audioSource === 'system';
+    if (useSystemAudio) {
+      if (!navigator.mediaDevices?.getDisplayMedia) {
+        setMicError('System audio capture unavailable. Switch to Microphone or use typed input.');
+        return;
+      }
+    } else if (!navigator.mediaDevices?.getUserMedia) {
       setMicError('Microphone API unavailable. Typed input remains usable.');
       return;
     }
 
     try {
-      const audioConstraint: MediaTrackConstraints = sttConfig?.deviceId
-        ? { deviceId: { exact: sttConfig.deviceId }, echoCancellation: true, noiseSuppression: true }
-        : { echoCancellation: true, noiseSuppression: true };
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraint, video: false });
-      micStreamRef.current = stream;
-      if (!sttConfig?.permissionGranted) {
-        await onSttConfigChange({ permissionGranted: true });
+      let stream: MediaStream;
+      if (useSystemAudio) {
+        stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+        for (const vt of stream.getVideoTracks()) {
+          vt.stop();
+          stream.removeTrack(vt);
+        }
+        if (stream.getAudioTracks().length === 0) {
+          for (const t of stream.getTracks()) t.stop();
+          throw new Error('No system audio track available.');
+        }
+      } else {
+        const audioConstraint: MediaTrackConstraints = sttConfig?.deviceId
+          ? { deviceId: { exact: sttConfig.deviceId }, echoCancellation: true, noiseSuppression: true }
+          : { echoCancellation: true, noiseSuppression: true };
+        stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraint, video: false });
       }
-      await refreshDevices();
+      micStreamRef.current = stream;
+      if (!useSystemAudio) {
+        if (!sttConfig?.permissionGranted) {
+          await onSttConfigChange({ permissionGranted: true });
+        }
+        await refreshDevices();
+      }
 
       const ctx = new AudioContext();
       audioCtxRef.current = ctx;
@@ -511,10 +538,10 @@ export function QaPanel({
     }
   }, [sttStatus, sttConfig, onSttConfigChange, refreshDevices, flushUtterance, stopMic]);
 
-  // Stop mic capture if STT provider or Deepgram model changes.
+  // Stop capture if STT provider, Deepgram model, or audio source changes.
   useEffect(() => {
     stopMic();
-  }, [sttConfig?.provider, sttConfig?.deepgramModel, stopMic]);
+  }, [sttConfig?.provider, sttConfig?.deepgramModel, sttConfig?.audioSource, stopMic]);
 
   // Listen to Deepgram cloud streaming events for the active session only.
   useEffect(() => {
@@ -560,7 +587,7 @@ export function QaPanel({
     const unsubMin = window.teleprompter.onWindowMinimized(() => stopMic());
     const onUnload = () => stopMic();
     window.addEventListener('beforeunload', onUnload);
-    return () => {
+  return () => {
       unsubMin();
       window.removeEventListener('beforeunload', onUnload);
       stopMic();
@@ -579,7 +606,9 @@ export function QaPanel({
       void flushUtterance(detail.isFinal);
     };
     window.addEventListener('qa-sample-audio', onSampleAudio);
-    return () => window.removeEventListener('qa-sample-audio', onSampleAudio);
+    const isSystemAudio = sttConfig?.audioSource === 'system';
+
+  return () => window.removeEventListener('qa-sample-audio', onSampleAudio);
   }, [flushUtterance]);
 
   const stopStream = () => {
@@ -600,13 +629,19 @@ export function QaPanel({
     const a = pairA.trim();
     if (!q || !a) return;
     const ref = pairRef.trim();
+    const alternatives = pairAlts
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
     const nextPair: QaPair = {
       id: `pair-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       question: q,
+      ...(alternatives.length > 0 ? { alternatives } : {}),
       answer: a,
       ...(ref ? { reference: ref } : {})
     };
     setPairQ('');
+    setPairAlts('');
     setPairA('');
     setPairRef('');
     updateKb({ approvedPairs: [nextPair, ...kb.approvedPairs] }, true);
@@ -614,6 +649,27 @@ export function QaPanel({
 
   const removeApprovedPair = (id: string) => {
     updateKb({ approvedPairs: kb.approvedPairs.filter((p) => p.id !== id) }, true);
+  };
+
+  const addGlossaryTerm = () => {
+    const canonical = glossaryCanonical.trim();
+    if (!canonical) return;
+    const aliases = glossaryAliases
+      .split(/[\n,]+/)
+      .map((a) => a.trim())
+      .filter(Boolean);
+    const nextTerm: GlossaryTerm = {
+      id: `term-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      canonical,
+      aliases
+    };
+    setGlossaryCanonical('');
+    setGlossaryAliases('');
+    updateKb({ glossary: [nextTerm, ...kb.glossary] }, true);
+  };
+
+  const removeGlossaryTerm = (id: string) => {
+    updateKb({ glossary: kb.glossary.filter((g) => g.id !== id) }, true);
   };
 
   const onInputKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -631,6 +687,8 @@ export function QaPanel({
         : 'Auto · Fast recommended'
       : aiConfig?.model?.trim() || 'No model';
   const hasKey = aiConfig ? aiConfig.hasKey[aiConfig.provider] : false;
+
+  const isSystemAudio = sttConfig?.audioSource === 'system';
 
   return (
     <section className="qa-panel" data-testid="qa-panel" aria-label="AI Q&A">
@@ -741,6 +799,57 @@ export function QaPanel({
           </div>
 
           <div className="qa-prep-section">
+            <span>Recognize these terms</span>
+            <input
+              type="text"
+              className="ai-text-input"
+              data-testid="qa-glossary-canonical"
+              placeholder="Canonical term (e.g. llama.cpp)"
+              value={glossaryCanonical}
+              onChange={(e) => setGlossaryCanonical(e.target.value)}
+            />
+            <div className="qa-pair-actions">
+              <input
+                type="text"
+                className="ai-text-input"
+                data-testid="qa-glossary-aliases"
+                placeholder="Aliases, comma-separated (optional, e.g. lamma ccp, llama cpp)"
+                value={glossaryAliases}
+                onChange={(e) => setGlossaryAliases(e.target.value)}
+              />
+              <button
+                type="button"
+                className="ai-mini-btn"
+                data-testid="qa-glossary-add"
+                disabled={!glossaryCanonical.trim()}
+                onClick={addGlossaryTerm}
+              >
+                Add term
+              </button>
+            </div>
+            {kb.glossary.length > 0 && (
+              <div className="qa-pair-list" data-testid="qa-glossary-list">
+                {kb.glossary.map((g) => (
+                  <div key={g.id} className="qa-pair-item" data-testid="qa-glossary-item">
+                    <div className="qa-pair-item-text">
+                      <strong>{g.canonical}</strong>
+                      {g.aliases.length > 0 && <span>Aliases: {g.aliases.join(', ')}</span>}
+                    </div>
+                    <button
+                      type="button"
+                      className="ai-mini-btn"
+                      data-testid="qa-glossary-remove"
+                      onClick={() => removeGlossaryTerm(g.id)}
+                    >
+                      Remove
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="qa-prep-section">
             <span>Approved Q&amp;A pairs (answered locally without API call)</span>
             <input
               type="text"
@@ -749,6 +858,14 @@ export function QaPanel({
               placeholder="Expected question (e.g. Why did you choose Vulkan?)"
               value={pairQ}
               onChange={(e) => setPairQ(e.target.value)}
+            />
+            <textarea
+              className="qa-prep-textarea"
+              data-testid="qa-pair-alts"
+              rows={2}
+              placeholder="Alternative questions, one per line (optional)"
+              value={pairAlts}
+              onChange={(e) => setPairAlts(e.target.value)}
             />
             <textarea
               className="qa-prep-textarea"
@@ -783,6 +900,9 @@ export function QaPanel({
                   <div key={p.id} className="qa-pair-item" data-testid="qa-pair-item">
                     <div className="qa-pair-item-text">
                       <strong>{p.question}</strong>
+                      {p.alternatives && p.alternatives.length > 0 && (
+                        <em>Alt: {p.alternatives.join(' | ')}</em>
+                      )}
                       <span>{p.answer}</span>
                       {p.reference && <em>Ref: {p.reference}</em>}
                     </div>
@@ -802,20 +922,33 @@ export function QaPanel({
       ) : (
         <>
           <div className="qa-mic-bar" data-testid="qa-mic-bar">
-            <select
-              className="ai-select qa-mic-device"
-              data-testid="mic-device"
-              aria-label="Microphone device"
-              value={sttConfig?.deviceId ?? ''}
-              onChange={(e) => void onSttConfigChange({ deviceId: e.target.value })}
-            >
-              <option value="">Default mic</option>
-              {devices.map((d, i) => (
-                <option key={d.deviceId || i} value={d.deviceId}>
-                  {d.label || `Microphone ${i + 1}`}
-                </option>
-              ))}
-            </select>
+            <CustomSelect
+              className="qa-audio-source"
+              testId="audio-source"
+              ariaLabel="Audio source"
+              value={sttConfig?.audioSource ?? 'mic'}
+              onChange={(val) => void onSttConfigChange({ audioSource: val as 'mic' | 'system' })}
+              options={[
+                { value: 'mic', label: 'Microphone' },
+                { value: 'system', label: 'System audio (Windows)' }
+              ]}
+            />
+            {!isSystemAudio && (
+              <CustomSelect
+                className="qa-mic-device"
+                testId="mic-device"
+                ariaLabel="Microphone device"
+                value={sttConfig?.deviceId ?? ''}
+                onChange={(val) => void onSttConfigChange({ deviceId: val })}
+                options={[
+                  { value: '', label: 'Default mic' },
+                  ...devices.map((d, i) => ({
+                    value: d.deviceId,
+                    label: d.label || `Microphone ${i + 1}`
+                  }))
+                ]}
+              />
+            )}
             <span className={`qa-mic-status ${listening ? 'listening' : ''}`} data-testid="mic-status">
               {listening ? 'Listening' : 'Mic Off'}
             </span>
@@ -826,7 +959,7 @@ export function QaPanel({
                 data-testid="mic-stop"
                 onClick={stopMic}
               >
-                Stop mic
+                {isSystemAudio ? 'Stop audio' : 'Stop mic'}
               </button>
             ) : (
               <button
@@ -835,14 +968,14 @@ export function QaPanel({
                 data-testid="mic-start"
                 onClick={() => void startMic()}
               >
-                Start mic
+                {isSystemAudio ? 'Start audio' : 'Start mic'}
               </button>
             )}
           </div>
 
           {sttConfig?.provider === 'deepgram' && (
             <div className="qa-disclosure" data-testid="qa-deepgram-notice">
-              Audio is sent to Deepgram ({sttConfig.deepgramModel}).
+              {isSystemAudio ? 'System audio' : 'Audio'} is sent to Deepgram ({sttConfig.deepgramModel}).
             </div>
           )}
 

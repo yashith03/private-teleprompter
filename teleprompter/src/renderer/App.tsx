@@ -28,6 +28,8 @@ import {
   type SttProviderId,
   type SttStatus
 } from '../shared/types';
+import { keyEventToDisplayBinding } from '../shared/shortcuts';
+import { CustomSelect, type CustomSelectOption } from './CustomSelect';
 import {
   CheckIcon, CloseIcon, EditIcon, MinimizeIcon, PauseIcon, PlayIcon, RestartIcon, SettingsIcon, ShieldIcon
 } from './icons';
@@ -57,6 +59,7 @@ export function App() {
   const runningRef = useRef(false);
   const editingRef = useRef(false);
   const activeTabRef = useRef<TopTab>('script');
+  const settingsOpenRef = useRef(false);
   const saveTimer = useRef<number | undefined>(undefined);
   const pending = useRef<Patch>({});
   const [scrubbing, setScrubbing] = useState(false);
@@ -173,6 +176,30 @@ export function App() {
   useEffect(() => { runningRef.current = running; }, [running]);
   useEffect(() => { editingRef.current = editing; }, [editing]);
   useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
+  useEffect(() => { settingsOpenRef.current = settingsOpen; }, [settingsOpen]);
+
+  const [capturingAction, setCapturingAction] = useState<ShortcutAction | null>(null);
+  const [shortcutError, setShortcutError] = useState<string | null>(null);
+  const shortcutsRef = useRef<ShortcutBindingStatus[]>([]);
+  const globalControlsRef = useRef(true);
+  const toggleBindingRef = useRef('Enter');
+  useEffect(() => { shortcutsRef.current = shortcuts; }, [shortcuts]);
+  useEffect(() => { if (s) globalControlsRef.current = s.globalScriptControls; }, [s?.globalScriptControls]);
+  useEffect(() => { if (s) toggleBindingRef.current = s.shortcuts.toggleScroll; }, [s?.shortcuts?.toggleScroll]);
+
+  useEffect(() => {
+    if (!s) return;
+    void window.teleprompter
+      .setScriptReaderActive(activeTab === 'script' && !editing && !settingsOpen)
+      .then(setShortcuts);
+  }, [s !== null, activeTab, editing, settingsOpen]);
+
+  useEffect(() => {
+    if (!settingsOpen) {
+      setCapturingAction(null);
+      setShortcutError(null);
+    }
+  }, [settingsOpen]);
 
   // Debounced local save of everything except privateNotes (which has its own channel).
   // Pending patches are merged so rapid changes of different fields are not lost.
@@ -464,16 +491,50 @@ export function App() {
       if (active && (['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName) || active.isContentEditable)) {
         return;
       }
-      if (action === 'toggle-scroll') toggleRun();
-      else if (action === 'step-up') stepScroll(-STEP_PX);
+      if (action === 'toggle-scroll') {
+        if (activeTabRef.current === 'script' && !editingRef.current && !settingsOpenRef.current) {
+          toggleRun();
+        }
+      } else if (action === 'step-up') stepScroll(-STEP_PX);
       else if (action === 'step-down') stepScroll(STEP_PX);
     });
-  }, [toggleRun, stepScroll]);
+  }, [stepScroll, toggleRun]);
 
-  // Space toggles scrolling, except while a control, modifier key, non-script tab, or editor is active
-  // (so Ctrl+Space never double-triggers and focused buttons/editor/chat input behave normally).
+  // Capture a new shortcut binding while Settings key-capture mode is active.
+  useEffect(() => {
+    if (!capturingAction) return;
+    const onCapture = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const res = keyEventToDisplayBinding(e);
+      if (res.cancel) {
+        setCapturingAction(null);
+        setShortcutError(null);
+        return;
+      }
+      if (res.ignore) return;
+      if (res.error || !res.binding) {
+        setShortcutError(res.error || 'Unsupported key for shortcut.');
+        setCapturingAction(null);
+        return;
+      }
+      const action = capturingAction;
+      setCapturingAction(null);
+      void window.teleprompter.updateShortcutBinding(action, res.binding).then((out) => {
+        setS(out.settings);
+        setShortcuts(out.status);
+        setShortcutError(out.ok ? null : (out.error || 'Could not assign shortcut.'));
+      });
+    };
+    window.addEventListener('keydown', onCapture, true);
+    return () => window.removeEventListener('keydown', onCapture, true);
+  }, [capturingAction]);
+
+  // Block Space from scrolling the reader or activating focused script controls,
+  // and handle local Start/Pause when global script controls are off or unregistered.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (capturingAction) return;
       if (e.key === 'Escape') {
         setSettingsOpen((open) => {
           if (open) gearRef.current?.focus();
@@ -481,18 +542,37 @@ export function App() {
         });
         return;
       }
-      if (
-        e.code !== 'Space' || e.repeat || e.ctrlKey || e.altKey || e.metaKey || e.shiftKey ||
-        editingRef.current || activeTabRef.current !== 'script'
-      ) return;
-      const t = e.target as HTMLElement | null;
-      if (t && (['BUTTON', 'INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName) || t.isContentEditable)) return;
-      e.preventDefault();
-      toggleRun();
+      const t = e.target;
+      const inEditable =
+        t instanceof HTMLElement &&
+        (['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName) ||
+          t.isContentEditable ||
+          Boolean(t.closest('[role="combobox"], [role="listbox"], [role="option"]')));
+
+      if (e.code === 'Space' || e.key === ' ') {
+        if (!inEditable) e.preventDefault();
+        return;
+      }
+
+      if (e.repeat || editingRef.current || activeTabRef.current !== 'script' || settingsOpenRef.current) return;
+      if (inEditable || (t instanceof HTMLElement && (t.tagName === 'BUTTON' || Boolean(t.closest('[data-testid="settings-popover"]'))))) {
+        return;
+      }
+
+      const globalToggleRegistered =
+        globalControlsRef.current &&
+        Boolean(shortcutsRef.current.find((item) => item.action === 'toggle-scroll')?.registered);
+      if (globalToggleRegistered) return;
+
+      const parsed = keyEventToDisplayBinding(e);
+      if (parsed.binding && parsed.binding === toggleBindingRef.current) {
+        e.preventDefault();
+        toggleRun();
+      }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [toggleRun]);
+  }, [toggleRun, capturingAction]);
 
   // Click outside closes the popover.
   useEffect(() => {
@@ -640,15 +720,6 @@ export function App() {
     syncProgressOnly(0);
   };
 
-  const toggleShortcut = shortcuts.find((item) => item.action === 'toggle-scroll');
-  const toggleHint = toggleShortcut?.registered === false
-    ? 'Ctrl+Space unavailable'
-    : 'Ctrl+Space / Space';
-
-  const privacyLabel = s.privateNotes
-    ? 'Private notes on: hidden from supported full-display capture.'
-    : 'Private notes off: visible in screen sharing and recordings.';
-
   const theme = s.theme === 'dark' ? 'dark' : 'light';
   const slideCount = parsedSlides.sections.length;
   const activeIdx = progress.activeIndex >= 0 ? progress.activeIndex : 0;
@@ -664,7 +735,6 @@ export function App() {
       >
         <header className="bar">
           <div
-            title={privacyLabel}
             data-testid="privacy-badge-container"
             className={`privacy ${s.privateNotes ? 'on' : 'off'}`}
             aria-live="polite"
@@ -705,7 +775,6 @@ export function App() {
             className="icon-btn"
             data-testid="minimize"
             aria-label="Minimize"
-            title="Minimize"
             onClick={() => void window.teleprompter.minimize()}
           >
             <MinimizeIcon />
@@ -715,7 +784,6 @@ export function App() {
             className="icon-btn"
             data-testid="close"
             aria-label="Quit teleprompter"
-            title="Quit"
             onClick={() => window.teleprompter.quit()}
           >
             <CloseIcon />
@@ -758,7 +826,6 @@ export function App() {
                         data-active={isActive ? 'true' : 'false'}
                         aria-current={isActive ? 'step' : undefined}
                         aria-label={segLabel}
-                        title={segLabel}
                         className={`slide-seg ${stateClass}`}
                         onClick={() => {
                           if (handledPointerUpRef.current) return;
@@ -869,7 +936,6 @@ export function App() {
             data-testid="toggle"
             className="btn-primary"
             aria-label={running ? 'Pause scrolling' : 'Start scrolling'}
-            title={running ? `Pause (${toggleHint})` : `Start (${toggleHint})`}
             onClick={toggleRun}
           >
             {running ? <PauseIcon /> : <PlayIcon />}
@@ -880,7 +946,6 @@ export function App() {
             data-testid="restart"
             className="icon-btn"
             aria-label="Restart from the top"
-            title="Restart"
             onClick={restart}
           >
             <RestartIcon />
@@ -891,7 +956,6 @@ export function App() {
             className={`icon-btn ${editing ? 'active' : ''}`}
             aria-label={editing ? 'Finish editing' : 'Edit script'}
             aria-pressed={editing}
-            title={editing ? 'Done editing' : 'Edit script'}
             onClick={() => { setRunning(false); setEditing((v) => !v); }}
           >
             {editing ? <CheckIcon /> : <EditIcon />}
@@ -905,7 +969,6 @@ export function App() {
             aria-label="Settings"
             aria-haspopup="dialog"
             aria-expanded={settingsOpen}
-            title="Settings"
             onClick={() => setSettingsOpen((o) => !o)}
           >
             <SettingsIcon />
@@ -939,21 +1002,21 @@ export function App() {
           hidden={!settingsOpen}
         >
           <label className="row">
-            <span>Speed</span>
-            <input data-testid="speed" type="range" min={10} max={300} step={5} value={s.speed}
-              aria-label="Scroll speed" title="Scroll speed"
+            <span>Speed <em className="row-val" data-testid="speed-value">{s.speed}</em></span>
+            <input data-testid="speed" type="range" min={2} max={100} step={1} value={s.speed}
+              aria-label="Scroll speed"
               onChange={(e) => change({ speed: Number(e.target.value) })} />
           </label>
           <label className="row">
             <span>Font</span>
             <input data-testid="font" type="range" min={16} max={96} step={2} value={s.fontSize}
-              aria-label="Font size" title="Font size"
+              aria-label="Font size"
               onChange={(e) => change({ fontSize: Number(e.target.value) })} />
           </label>
           <label className="row">
             <span>Background</span>
             <input data-testid="opacity" type="range" min={0.3} max={1} step={0.05} value={s.opacity}
-              aria-label="Background opacity" title="Background opacity (script text stays fully opaque)"
+              aria-label="Background opacity"
               onChange={(e) => change({ opacity: Number(e.target.value) })} />
           </label>
           <div className="row">
@@ -963,7 +1026,6 @@ export function App() {
               role="switch"
               aria-checked={s.privateNotes}
               aria-label="Private notes"
-              title="Toggle Private notes protection"
               data-testid="privacy-toggle"
               className={`theme-switch ${s.privateNotes ? 'on' : 'off'}`}
               disabled={privacyPending}
@@ -984,7 +1046,6 @@ export function App() {
               role="switch"
               aria-checked={theme === 'dark'}
               aria-label="Theme"
-              title="Switch between Light and Dark themes"
               data-testid="theme-toggle"
               className={`theme-switch ${theme}`}
               onClick={() => change({ theme: theme === 'dark' ? 'light' : 'dark' })}
@@ -992,34 +1053,89 @@ export function App() {
               {theme === 'dark' ? 'Dark' : 'Light'}
             </button>
           </div>
-          <div className="shortcuts" data-testid="shortcuts-list" aria-label="Global shortcuts">
-            <div className="shortcuts-title">Global shortcuts</div>
-            {shortcuts.map((item) => (
-              <div key={item.action} className="shortcut-row" data-testid={`shortcut-${item.action}`}>
-                <span>{item.description}</span>
-                <span className={`kbd ${item.registered ? '' : 'unavailable'}`}>
-                  {item.registered ? item.accelerator : `${item.accelerator} (Unavailable)`}
-                </span>
+          <div className="shortcuts" data-testid="shortcuts-list" aria-label="Shortcuts">
+            <div className="shortcuts-header">
+              <div className="shortcuts-title">Script Controls</div>
+              <button
+                type="button"
+                className="shortcut-reset-btn"
+                data-testid="shortcuts-reset"
+                onClick={() => {
+                  setCapturingAction(null);
+                  setShortcutError(null);
+                  void window.teleprompter.resetShortcutBindings().then((out) => {
+                    setS(out.settings);
+                    setShortcuts(out.status);
+                  });
+                }}
+              >
+                Reset
+              </button>
+            </div>
+            <div className="row">
+              <span>Global shortcuts</span>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={s.globalScriptControls}
+                aria-label="Global Script Controls"
+                data-testid="global-shortcuts-switch"
+                className={`theme-switch ${s.globalScriptControls ? 'on' : 'off'}`}
+                onClick={() => {
+                  const nextVal = !s.globalScriptControls;
+                  setS((cur) => (cur ? { ...cur, globalScriptControls: nextVal } : cur));
+                  void window.teleprompter.updateSettings({ globalScriptControls: nextVal });
+                }}
+              >
+                {s.globalScriptControls ? 'ON' : 'OFF'}
+              </button>
+            </div>
+            {shortcuts.map((item) => {
+              const isCapturing = capturingAction === item.action;
+              return (
+                <div key={item.action} className="shortcut-row" data-testid={`shortcut-${item.action}`}>
+                  <span>{item.description}</span>
+                  <button
+                    type="button"
+                    data-testid={`shortcut-bind-${item.action}`}
+                    className={`kbd shortcut-bind-btn ${isCapturing ? 'capturing' : ''}`}
+                    onClick={() => {
+                      setShortcutError(null);
+                      setCapturingAction(isCapturing ? null : item.action);
+                    }}
+                  >
+                    {isCapturing ? 'Press key...' : item.accelerator}
+                  </button>
+                </div>
+              );
+            })}
+            {shortcutError && (
+              <div className="shortcut-error" data-testid="shortcut-error" role="status">
+                {shortcutError}
               </div>
-            ))}
+            )}
+            {s.globalScriptControls && s.shortcuts.toggleScroll === 'Enter' && (
+              <div className="shortcut-note" data-testid="shortcut-global-note">
+                Enter is global on the Script reader and released in Settings, Edit, and Q&amp;A.
+              </div>
+            )}
           </div>
           {aiConfig && (
             <div className="ai-settings" data-testid="ai-settings" aria-label="AI Provider">
               <div className="shortcuts-title">AI Provider</div>
-              <label className="row">
+              <div className="row">
                 <span>Provider</span>
-                <select
-                  className="ai-select"
-                  data-testid="ai-provider"
-                  aria-label="AI Provider"
+                <CustomSelect
+                  testId="ai-provider"
+                  ariaLabel="AI Provider"
                   value={aiConfig.provider}
-                  onChange={(e) => void onAiConfigChange({ provider: e.target.value as AiProviderId })}
-                >
-                  {(Object.keys(AI_PROVIDER_PRESETS) as AiProviderId[]).map((id) => (
-                    <option key={id} value={id}>{AI_PROVIDER_PRESETS[id].label}</option>
-                  ))}
-                </select>
-              </label>
+                  onChange={(val) => void onAiConfigChange({ provider: val as AiProviderId })}
+                  options={(Object.keys(AI_PROVIDER_PRESETS) as AiProviderId[]).map((id) => ({
+                    value: id,
+                    label: AI_PROVIDER_PRESETS[id].label
+                  }))}
+                />
+              </div>
               {aiConfig.provider === 'custom' && (
                 <label className="ai-field">
                   <span>Endpoint URL</span>
@@ -1078,15 +1194,48 @@ export function App() {
                       ? '__auto__'
                       : savedModel || '__auto__';
 
+                  const modelOptions: CustomSelectOption[] = [
+                    {
+                      value: '__auto__',
+                      label: topRec
+                        ? `Auto · Fast recommended (${topRec.id} · ${topRec.speedNote})`
+                        : 'Auto · Fast recommended'
+                    },
+                    ...recommendedModels.map((m) => ({
+                      value: m.id,
+                      label: `${m.id} · ${m.speedNote}`,
+                      group: 'Recommended (fast Q&A)'
+                    })),
+                    ...discoveredSelectable.map((m) => ({
+                      value: m.id,
+                      label:
+                        m.capability === 'unknown'
+                          ? `${m.id} (unverified capabilities)`
+                          : `${m.id}${m.observedFirstTokenMs ? ` (${m.observedFirstTokenMs}ms)` : ''}`,
+                      group: 'All models'
+                    })),
+                    ...(aiConfig.modelMode === 'manual' && savedModel && !savedInDiscovered
+                      ? [
+                          {
+                            value: savedModel,
+                            label: isRetiredSavedModel
+                              ? `${savedModel} (Unavailable / retired)`
+                              : `${savedModel} (saved)`
+                          }
+                        ]
+                      : []),
+                    { value: '__manual__', label: 'Enter model ID manually' }
+                  ];
+
                   return (
                     <>
-                      <select
-                        className="ai-select full"
-                        data-testid="ai-model-select"
-                        aria-label="Select model"
+                      <CustomSelect
+                        fullWidth
+                        testId="ai-model-select"
+                        ariaLabel="Select model"
                         value={selectValue}
-                        onChange={(e) => {
-                          const val = e.target.value;
+                        options={modelOptions}
+                        onChange={(val) => {
                           if (val === '__manual__') {
                             setManualModelMode(true);
                           } else if (val === '__auto__') {
@@ -1097,41 +1246,7 @@ export function App() {
                             void onAiConfigChange({ modelMode: 'manual', model: val });
                           }
                         }}
-                      >
-                        <option value="__auto__">
-                          {topRec
-                            ? `Auto · Fast recommended (${topRec.id} · ${topRec.speedNote})`
-                            : 'Auto · Fast recommended'}
-                        </option>
-                        {recommendedModels.length > 0 && (
-                          <optgroup label="Recommended (fast Q&A)">
-                            {recommendedModels.map((m) => (
-                              <option key={`rec-${m.id}`} value={m.id}>
-                                {m.id} · {m.speedNote}
-                              </option>
-                            ))}
-                          </optgroup>
-                        )}
-                        {discoveredSelectable.length > 0 && (
-                          <optgroup label="All models">
-                            {discoveredSelectable.map((m) => (
-                              <option key={`all-${m.id}`} value={m.id}>
-                                {m.capability === 'unknown'
-                                  ? `${m.id} (unverified capabilities)`
-                                  : `${m.id}${m.observedFirstTokenMs ? ` (${m.observedFirstTokenMs}ms)` : ''}`}
-                              </option>
-                            ))}
-                          </optgroup>
-                        )}
-                        {aiConfig.modelMode === 'manual' && savedModel && !savedInDiscovered && (
-                          <option value={savedModel}>
-                            {isRetiredSavedModel
-                              ? `${savedModel} (Unavailable / retired)`
-                              : `${savedModel} (saved)`}
-                          </option>
-                        )}
-                        <option value="__manual__">Enter model ID manually</option>
-                      </select>
+                      />
                       {isRetiredSavedModel && (
                         <div className="ai-status err" data-testid="ai-model-retired">
                           <span>
@@ -1240,19 +1355,19 @@ export function App() {
           {sttConfig && (
             <div className="settings-ai-section" data-testid="stt-settings">
               <div className="settings-ai-title">Voice / Speech-to-Text</div>
-              <label className="row">
+              <div className="row">
                 <span>Speech-to-text</span>
-                <select
-                  className="ai-select"
-                  data-testid="stt-provider"
-                  aria-label="Speech-to-text provider"
+                <CustomSelect
+                  testId="stt-provider"
+                  ariaLabel="Speech-to-text provider"
                   value={sttConfig.provider}
-                  onChange={(e) => void onSttConfigChange({ provider: e.target.value as SttProviderId })}
-                >
-                  <option value="whisper">Local Whisper</option>
-                  <option value="deepgram">Deepgram</option>
-                </select>
-              </label>
+                  onChange={(val) => void onSttConfigChange({ provider: val as SttProviderId })}
+                  options={[
+                    { value: 'whisper', label: 'Local Whisper' },
+                    { value: 'deepgram', label: 'Deepgram' }
+                  ]}
+                />
+              </div>
               {sttConfig.provider === 'deepgram' && (
                 <div className="qa-disclosure" data-testid="stt-deepgram-notice">
                   Audio is sent to Deepgram.
@@ -1265,7 +1380,6 @@ export function App() {
                   role="switch"
                   aria-checked={sttConfig.autoListen}
                   aria-label="Auto-listen in AI Q&A"
-                  title="Toggle Auto-listen in AI Q&A"
                   data-testid="stt-autolisten-toggle"
                   className={`theme-switch ${sttConfig.autoListen ? 'on' : 'off'}`}
                   onClick={() => void onSttConfigChange({ autoListen: !sttConfig.autoListen })}
@@ -1287,21 +1401,22 @@ export function App() {
               </label>
               {sttConfig.provider === 'deepgram' ? (
                 <>
-                  <label className="ai-field">
+                  <div className="ai-field">
                     <span>Deepgram Model</span>
-                    <select
-                      className="ai-select full"
-                      data-testid="stt-deepgram-model"
-                      aria-label="Deepgram model"
+                    <CustomSelect
+                      fullWidth
+                      testId="stt-deepgram-model"
+                      ariaLabel="Deepgram model"
                       value={sttConfig.deepgramModel}
-                      onChange={(e) =>
-                        void onSttConfigChange({ deepgramModel: e.target.value as DeepgramModelId })
+                      onChange={(val) =>
+                        void onSttConfigChange({ deepgramModel: val as DeepgramModelId })
                       }
-                    >
-                      <option value="flux-general-en">Flux English (flux-general-en)</option>
-                      <option value="nova-3">Nova-3 (nova-3)</option>
-                    </select>
-                  </label>
+                      options={[
+                        { value: 'flux-general-en', label: 'Flux English (flux-general-en)' },
+                        { value: 'nova-3', label: 'Nova-3 (nova-3)' }
+                      ]}
+                    />
+                  </div>
                   <div className="ai-field">
                     <span>Deepgram API Key</span>
                     <div className="ai-key-row">
@@ -1375,7 +1490,6 @@ export function App() {
             type="button"
             data-testid="reopen"
             className="btn-secondary"
-            title="Recreate the overlay window using saved settings"
             onClick={() => void window.teleprompter.reopenOverlay()}
           >
             Reopen overlay
@@ -1386,7 +1500,6 @@ export function App() {
           className="grip"
           role="separator"
           aria-label="Resize"
-          title="Drag to resize"
           onPointerDown={onGripDown}
           onPointerMove={onGripMove}
           onPointerUp={onGripUp}

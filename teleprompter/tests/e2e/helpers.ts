@@ -95,6 +95,11 @@ export async function launchTeleprompterApp(opts: LaunchOptions = {}): Promise<L
   return { electronApp, page, userDataDir, consoleErrors, pageErrors, close };
 }
 
+export async function selectCustomOption(page: Page, testId: string, value: string): Promise<void> {
+  await page.getByTestId(testId).click();
+  await page.getByTestId(`${testId}-option-${value}`).first().click();
+}
+
 export type MockAiMode =
   | 'ok'
   | 'invalid_key'

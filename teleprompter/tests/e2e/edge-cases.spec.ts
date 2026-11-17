@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { launchTeleprompterApp, startMockAiServer } from './helpers';
+import { launchTeleprompterApp, selectCustomOption, startMockAiServer } from './helpers';
 
 test.describe('Edge Cases & Resiliency', () => {
   test('handles empty inputs, rapid provider/model switching, retired models, network errors, and window resize/minimize', async () => {
@@ -15,17 +15,16 @@ test.describe('Edge Cases & Resiliency', () => {
 
       // 2. Rapid provider switching does not leak stale state
       await app.page.getByTestId('qa-open-settings').click();
-      const providerSel = app.page.getByTestId('ai-provider');
-      await providerSel.selectOption('groq');
-      await providerSel.selectOption('nvidia');
-      await providerSel.selectOption('gemini');
-      await providerSel.selectOption('custom');
+      await selectCustomOption(app.page, 'ai-provider', 'groq');
+      await selectCustomOption(app.page, 'ai-provider', 'nvidia');
+      await selectCustomOption(app.page, 'ai-provider', 'gemini');
+      await selectCustomOption(app.page, 'ai-provider', 'custom');
       await app.page.getByTestId('ai-custom-url').fill(mock.baseUrl);
       await app.page.getByTestId('ai-list-models').click();
-      await expect(app.page.getByTestId('ai-model-select')).toHaveValue('__auto__');
+      await expect(app.page.getByTestId('ai-model-select')).toHaveAttribute('data-value', '__auto__');
 
       // 3. Retired saved model is flagged and replaceable
-      await app.page.getByTestId('ai-model-select').selectOption('__manual__');
+      await selectCustomOption(app.page, 'ai-model-select', '__manual__');
       await app.page.getByTestId('ai-model-input').fill('retired-model-xyz');
       await app.page.getByTestId('ai-list-models').click();
       await expect(app.page.getByTestId('ai-model-retired')).toBeVisible();

@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   launchTeleprompterApp,
+  selectCustomOption,
   startMockAiServer,
   startMockDeepgramServer
 } from './helpers';
@@ -17,11 +18,11 @@ test.describe('Adding, Editing, Deleting & Answering Questions', () => {
     try {
       // Configure AI custom endpoint + Deepgram Nova-3
       await app.page.getByTestId('settings').click();
-      await app.page.getByTestId('ai-provider').selectOption('custom');
+      await selectCustomOption(app.page, 'ai-provider', 'custom');
       await app.page.getByTestId('ai-custom-url').fill(aiMock.baseUrl);
       await app.page.getByTestId('ai-list-models').click();
-      await app.page.getByTestId('stt-provider').selectOption('deepgram');
-      await app.page.getByTestId('stt-deepgram-model').selectOption('nova-3');
+      await selectCustomOption(app.page, 'stt-provider', 'deepgram');
+      await selectCustomOption(app.page, 'stt-deepgram-model', 'nova-3');
       await app.page.getByTestId('stt-deepgram-key-input').fill('dg-q-key');
       await app.page.getByTestId('stt-deepgram-key-save').click();
       await app.page.getByTestId('settings').click();
@@ -110,7 +111,7 @@ test.describe('Adding, Editing, Deleting & Answering Questions', () => {
 
     try {
       await app.page.getByTestId('settings').click();
-      await app.page.getByTestId('ai-provider').selectOption('custom');
+      await selectCustomOption(app.page, 'ai-provider', 'custom');
       await app.page.getByTestId('ai-custom-url').fill(aiMock.baseUrl);
       await app.page.getByTestId('ai-list-models').click();
       await app.page.getByTestId('privacy-badge').click();
@@ -224,11 +225,11 @@ test.describe('Adding, Editing, Deleting & Answering Questions', () => {
 
     try {
       await app.page.getByTestId('settings').click();
-      await app.page.getByTestId('ai-provider').selectOption('custom');
+      await selectCustomOption(app.page, 'ai-provider', 'custom');
       await app.page.getByTestId('ai-custom-url').fill(aiMock.baseUrl);
       await app.page.getByTestId('ai-list-models').click();
-      await app.page.getByTestId('stt-provider').selectOption('deepgram');
-      await app.page.getByTestId('stt-deepgram-model').selectOption('nova-3');
+      await selectCustomOption(app.page, 'stt-provider', 'deepgram');
+      await selectCustomOption(app.page, 'stt-deepgram-model', 'nova-3');
       await app.page.getByTestId('stt-deepgram-key-input').fill('dg-inst-key');
       await app.page.getByTestId('stt-deepgram-key-save').click();
       await app.page.getByTestId('privacy-badge').click();
@@ -256,8 +257,8 @@ test.describe('Adding, Editing, Deleting & Answering Questions', () => {
 
       // 3. Retained across provider switch
       await app.page.getByTestId('qa-open-settings').click();
-      await app.page.getByTestId('ai-provider').selectOption('groq');
-      await app.page.getByTestId('ai-provider').selectOption('custom');
+      await selectCustomOption(app.page, 'ai-provider', 'groq');
+      await selectCustomOption(app.page, 'ai-provider', 'custom');
       await app.page.getByTestId('privacy-badge').click();
       await expect(instInput).toHaveValue(customInst);
 
@@ -325,7 +326,7 @@ test.describe('Adding, Editing, Deleting & Answering Questions', () => {
 
     try {
       await app.page.getByTestId('settings').click();
-      await app.page.getByTestId('ai-provider').selectOption('custom');
+      await selectCustomOption(app.page, 'ai-provider', 'custom');
       await app.page.getByTestId('ai-custom-url').fill(aiMock.baseUrl);
       await app.page.getByTestId('ai-list-models').click();
       await app.page.getByTestId('privacy-badge').click();
@@ -337,13 +338,13 @@ test.describe('Adding, Editing, Deleting & Answering Questions', () => {
         });
       });
 
-      const callsBefore = aiMock.requestCount();
+      const callsBefore = aiMock.chatModelsSeen().length;
       await app.page.getByTestId('qa-input').fill('whats my methologolgy');
       await app.page.getByTestId('qa-send').click();
 
       await expect(app.page.getByTestId('qa-msg-assistant').last()).toContainText('Vulkan control.');
       await expect(app.page.getByTestId('qa-msg-meta').last()).toContainText('Sources: Slide 13');
-      expect(aiMock.requestCount()).toBe(callsBefore + 1);
+      expect(aiMock.chatModelsSeen().length).toBe(callsBefore + 1);
 
       // Also verify fuzzy matching against an approved Q&A pair (0 API calls)
       await app.page.getByTestId('qa-subtab-prepare').click();
@@ -352,13 +353,91 @@ test.describe('Adding, Editing, Deleting & Answering Questions', () => {
       await app.page.getByTestId('qa-pair-add').click();
 
       await app.page.getByTestId('qa-subtab-ask').click();
-      const callsBeforeApproved = aiMock.requestCount();
+      const callsBeforeApproved = aiMock.chatModelsSeen().length;
       await app.page.getByTestId('qa-input').fill('whats my methologolgy');
       await app.page.getByTestId('qa-send').click();
 
       await expect(app.page.getByTestId('qa-msg-assistant').last()).toContainText('Three-cohort stratified cross-validation.');
       await expect(app.page.getByTestId('qa-msg-meta').last()).toContainText('Approved Q&A (local · no API call)');
-      expect(aiMock.requestCount()).toBe(callsBeforeApproved);
+      expect(aiMock.chatModelsSeen().length).toBe(callsBeforeApproved);
+
+      expect(app.consoleErrors).toEqual([]);
+      expect(app.pageErrors).toEqual([]);
+    } finally {
+      await app.close();
+      await aiMock.close();
+    }
+  });
+
+  test('editable glossary and alternative questions: matches pinnedlamma ccp meaning & lock version without matching What is llama.cpp?', async () => {
+    const aiMock = await startMockAiServer();
+    const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-e2e-glossary-'));
+    let app = await launchTeleprompterApp({ existingUserDataDir: userDataDir });
+
+    try {
+      await app.page.getByTestId('settings').click();
+      await selectCustomOption(app.page, 'ai-provider', 'custom');
+      await app.page.getByTestId('ai-custom-url').fill(aiMock.baseUrl);
+      await app.page.getByTestId('ai-list-models').click();
+      await app.page.getByTestId('privacy-badge').click();
+
+      await app.page.getByTestId('tab-qa').click();
+      await app.page.evaluate(async () => {
+        await window.teleprompter.updateQaKnowledge({
+          slideSpeech: 'Slide 2   Runtime\nllama.cpp is our local C++ inference engine for running quantized GGUF models.'
+        });
+      });
+
+      // Add editable glossary entries (longest alias must win over shorter alias)
+      await app.page.getByTestId('qa-subtab-prepare').click();
+      await app.page.getByTestId('qa-glossary-canonical').fill('llama.cpp');
+      await app.page.getByTestId('qa-glossary-aliases').fill('lamma ccp, llama cpp');
+      await app.page.getByTestId('qa-glossary-add').click();
+
+      await app.page.getByTestId('qa-glossary-canonical').fill('pinned llama.cpp');
+      await app.page.getByTestId('qa-glossary-aliases').fill('pinnedlamma ccp');
+      await app.page.getByTestId('qa-glossary-add').click();
+      await expect(app.page.getByTestId('qa-glossary-item')).toHaveCount(2);
+
+      // Add approved Q&A pair with Alternative questions
+      await app.page.getByTestId('qa-pair-q').fill('Why did you lock the llama.cpp version?');
+      await app.page.getByTestId('qa-pair-alts').fill('pinned llama.cpp meaning\nWhy is llama.cpp pinned?');
+      await app.page.getByTestId('qa-pair-a').fill('We pinned llama.cpp so benchmark comparisons stay reproducible.');
+      await app.page.getByTestId('qa-pair-ref').fill('Slide 2');
+      await app.page.getByTestId('qa-pair-add').click();
+
+      // Verify persistence across restart
+      await app.close();
+      app = await launchTeleprompterApp({ existingUserDataDir: userDataDir });
+      await app.page.getByTestId('tab-qa').click();
+      await app.page.getByTestId('qa-subtab-prepare').click();
+      await expect(app.page.getByTestId('qa-glossary-item')).toHaveCount(2);
+      await expect(app.page.getByTestId('qa-pair-item').first()).toContainText('pinned llama.cpp meaning');
+
+      await app.page.getByTestId('qa-subtab-ask').click();
+      const callsBefore = aiMock.chatModelsSeen().length;
+
+      // 1. "pinnedlamma ccp meaning" -> keeps original question visible, matches approved pair (0 API calls)
+      await app.page.getByTestId('qa-input').fill('pinnedlamma ccp meaning');
+      await app.page.getByTestId('qa-send').click();
+      await expect(app.page.getByTestId('qa-msg-user').last()).toContainText('pinnedlamma ccp meaning');
+      await expect(app.page.getByTestId('qa-msg-assistant').last()).toContainText('We pinned llama.cpp so benchmark comparisons stay reproducible.');
+      await expect(app.page.getByTestId('qa-msg-meta').last()).toContainText('Approved Q&A (local · no API call)');
+      expect(aiMock.chatModelsSeen().length).toBe(callsBefore);
+
+      // 2. "Why did you lock the llama.cpp version?" -> matches same approved pair (0 API calls)
+      await app.page.getByTestId('qa-input').fill('Why did you lock the llama.cpp version?');
+      await app.page.getByTestId('qa-send').click();
+      await expect(app.page.getByTestId('qa-msg-assistant').last()).toContainText('We pinned llama.cpp so benchmark comparisons stay reproducible.');
+      await expect(app.page.getByTestId('qa-msg-meta').last()).toContainText('Approved Q&A (local · no API call)');
+      expect(aiMock.chatModelsSeen().length).toBe(callsBefore);
+
+      // 3. "What is llama.cpp?" -> must NOT match pinning answer; falls back to grounded Slide 2 retrieval
+      await app.page.getByTestId('qa-input').fill('What is llama.cpp?');
+      await app.page.getByTestId('qa-send').click();
+      await expect(app.page.getByTestId('qa-msg-assistant').last()).not.toContainText('We pinned llama.cpp');
+      await expect(app.page.getByTestId('qa-msg-meta').last()).toContainText('Sources: Slide 2');
+      expect(aiMock.chatModelsSeen().length).toBe(callsBefore + 1);
 
       expect(app.consoleErrors).toEqual([]);
       expect(app.pageErrors).toEqual([]);

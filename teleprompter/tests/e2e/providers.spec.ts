@@ -2,7 +2,7 @@ import { expect, test } from '@playwright/test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { launchTeleprompterApp, startMockAiServer } from './helpers';
+import { launchTeleprompterApp, selectCustomOption, startMockAiServer } from './helpers';
 
 test.describe('Providers & API Configuration', () => {
   test('switches between all AI and STT providers, saves mock keys, persists across relaunch, and handles invalid keys', async () => {
@@ -17,8 +17,8 @@ test.describe('Providers & API Configuration', () => {
       // Switch through every AI provider: gemini, groq, nvidia, custom
       const aiProvider = app1.page.getByTestId('ai-provider');
       for (const id of ['gemini', 'groq', 'nvidia', 'custom'] as const) {
-        await aiProvider.selectOption(id);
-        await expect(aiProvider).toHaveValue(id);
+        await selectCustomOption(app1.page, 'ai-provider', id);
+        await expect(aiProvider).toHaveAttribute('data-value', id);
       }
 
       // Custom endpoint URL + mock API key save & persistence check
@@ -41,8 +41,8 @@ test.describe('Providers & API Configuration', () => {
 
       // Switch STT provider: whisper -> deepgram (verify disclosure + Deepgram key save) -> whisper
       const sttProvider = app1.page.getByTestId('stt-provider');
-      await expect(sttProvider).toHaveValue('whisper');
-      await sttProvider.selectOption('deepgram');
+      await expect(sttProvider).toHaveAttribute('data-value', 'whisper');
+      await selectCustomOption(app1.page, 'stt-provider', 'deepgram');
       await expect(app1.page.getByTestId('stt-deepgram-notice')).toContainText('Audio is sent to Deepgram');
       await app1.page.getByTestId('stt-deepgram-key-input').fill('dg-mock-key-123');
       await app1.page.getByTestId('stt-deepgram-key-save').click();
@@ -61,9 +61,9 @@ test.describe('Providers & API Configuration', () => {
     const app2 = await launchTeleprompterApp({ existingUserDataDir: sharedDir });
     try {
       await app2.page.getByTestId('settings').click();
-      await expect(app2.page.getByTestId('ai-provider')).toHaveValue('custom');
+      await expect(app2.page.getByTestId('ai-provider')).toHaveAttribute('data-value', 'custom');
       await expect(app2.page.getByTestId('ai-custom-url')).toHaveValue(mock.baseUrl);
-      await expect(app2.page.getByTestId('stt-provider')).toHaveValue('deepgram');
+      await expect(app2.page.getByTestId('stt-provider')).toHaveAttribute('data-value', 'deepgram');
 
       const cfg2 = await app2.page.evaluate(() => window.teleprompter.getAiConfig());
       expect(cfg2.hasKey.custom).toBe(true);

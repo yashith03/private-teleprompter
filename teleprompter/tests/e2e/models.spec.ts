@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { launchTeleprompterApp, startMockAiServer } from './helpers';
+import { launchTeleprompterApp, selectCustomOption, startMockAiServer } from './helpers';
 
 test.describe('Model Switching & Live Discovery', () => {
   test('switches across every discovered model, updates UI and request payloads, and switches mid-session', async () => {
@@ -7,18 +7,21 @@ test.describe('Model Switching & Live Discovery', () => {
     const app = await launchTeleprompterApp();
     try {
       await app.page.getByTestId('settings').click();
-      await app.page.getByTestId('ai-provider').selectOption('custom');
+      await selectCustomOption(app.page, 'ai-provider', 'custom');
       await app.page.getByTestId('ai-custom-url').fill(mock.baseUrl);
       await app.page.getByTestId('ai-list-models').click();
 
       const modelSelect = app.page.getByTestId('ai-model-select');
-      await expect(modelSelect).toHaveValue('__auto__');
-      await expect(modelSelect.locator('option').first()).toHaveAttribute('value', '__auto__');
+      await expect(modelSelect).toHaveAttribute('data-value', '__auto__');
+      await expect(modelSelect).toHaveAttribute('data-first-value', '__auto__');
 
-      // Verify excluded non-chat model is filtered out, while chat & unknown models are selectable
-      const optionValues = await modelSelect
-        .locator('option')
-        .evaluateAll((opts) => opts.map((o) => (o as HTMLOptionElement).value));
+      // Open menu and verify excluded non-chat model is filtered out, while chat & unknown models are selectable
+      await modelSelect.click();
+      const optionValues = await app.page
+        .getByTestId('ai-model-select-menu')
+        .locator('[role="option"]')
+        .evaluateAll((opts) => opts.map((o) => o.getAttribute('data-value') || ''));
+      await modelSelect.click();
       expect(optionValues).not.toContain('whisper-large-v3');
       expect(optionValues).toContain('llama-3.1-8b-instant');
       expect(optionValues).toContain('llama-3.3-70b-versatile');
@@ -27,8 +30,8 @@ test.describe('Model Switching & Live Discovery', () => {
 
       // Switch across multiple models and verify Test Connection sends the selected model in payload
       for (const modelId of ['llama-3.1-8b-instant', 'llama-3.3-70b-versatile', 'gpt-4o-mini']) {
-        await modelSelect.selectOption(modelId);
-        await expect(modelSelect).toHaveValue(modelId);
+        await selectCustomOption(app.page, 'ai-model-select', modelId);
+        await expect(modelSelect).toHaveAttribute('data-value', modelId);
         await app.page.getByTestId('ai-test-connection').click();
         await expect(app.page.getByTestId('ai-test-status')).toContainText('Connected');
         expect(mock.lastChatModel()).toBe(modelId);
@@ -46,7 +49,7 @@ test.describe('Model Switching & Live Discovery', () => {
 
       // Switch mid-session to Auto · Fast recommended and ask question 2
       await app.page.getByTestId('qa-open-settings').click();
-      await app.page.getByTestId('ai-model-select').selectOption('__auto__');
+      await selectCustomOption(app.page, 'ai-model-select', '__auto__');
       await app.page.getByTestId('privacy-badge').click();
       await expect(app.page.getByTestId('settings-popover')).toBeHidden();
       await expect(app.page.getByTestId('qa-model-label')).toContainText('Auto · ');

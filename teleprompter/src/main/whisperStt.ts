@@ -6,6 +6,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import type {
   DeepgramModelId,
+  SttAudioSource,
   SttConfig,
   SttProviderId,
   SttStatus,
@@ -18,10 +19,12 @@ const execFileAsync = promisify(execFile);
 
 const VALID_STT_PROVIDERS = new Set<SttProviderId>(['whisper', 'deepgram']);
 const VALID_DEEPGRAM_MODELS = new Set<DeepgramModelId>(['flux-general-en', 'nova-3']);
+const VALID_AUDIO_SOURCES = new Set<SttAudioSource>(['mic', 'system']);
 
 const DEFAULT_STT_CONFIG: SttConfig = {
   provider: 'whisper',
   deepgramModel: 'flux-general-en',
+  audioSource: 'mic',
   language: 'en',
   modelPath: '',
   binaryPath: '',
@@ -160,9 +163,14 @@ export class WhisperSttService {
         typeof raw.deepgramModel === 'string' && VALID_DEEPGRAM_MODELS.has(raw.deepgramModel as DeepgramModelId)
           ? (raw.deepgramModel as DeepgramModelId)
           : 'flux-general-en';
+      const audioSource: SttAudioSource =
+        typeof raw.audioSource === 'string' && VALID_AUDIO_SOURCES.has(raw.audioSource as SttAudioSource)
+          ? (raw.audioSource as SttAudioSource)
+          : 'mic';
       return {
         provider,
         deepgramModel,
+        audioSource,
         language: typeof raw.language === 'string' && raw.language.trim() ? raw.language.trim().slice(0, 16) : 'en',
         modelPath: typeof raw.modelPath === 'string' ? raw.modelPath.trim().slice(0, 500) : '',
         binaryPath: typeof raw.binaryPath === 'string' ? raw.binaryPath.trim().slice(0, 500) : '',
@@ -202,6 +210,10 @@ export class WhisperSttService {
     ) {
       if (patch.deepgramModel !== this.config.deepgramModel) stopCloud = true;
       this.config.deepgramModel = patch.deepgramModel as DeepgramModelId;
+    }
+    if (typeof patch.audioSource === 'string' && VALID_AUDIO_SOURCES.has(patch.audioSource as SttAudioSource)) {
+      if (patch.audioSource !== this.config.audioSource) stopCloud = true;
+      this.config.audioSource = patch.audioSource as SttAudioSource;
     }
     if (typeof patch.language === 'string' && patch.language.trim()) {
       this.config.language = patch.language.trim().slice(0, 16);
