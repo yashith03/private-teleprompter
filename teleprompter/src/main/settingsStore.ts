@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { DEFAULT_SCRIPT, type Settings } from '../shared/types';
+import { DEFAULT_SCRIPT, type ScriptShortcuts, type Settings } from '../shared/types';
+import { DEFAULT_SCRIPT_SHORTCUTS, normalizeDisplayBinding } from '../shared/shortcuts';
 
 export interface Bounds { x: number; y: number; width: number; height: number }
 interface Persisted extends Settings { bounds?: Bounds }
@@ -11,11 +12,29 @@ const DEFAULTS: Persisted = {
   speed: 60,
   fontSize: 32,
   opacity: 0.92,
-  theme: 'light'
+  theme: 'light',
+  globalScriptControls: true,
+  shortcuts: { ...DEFAULT_SCRIPT_SHORTCUTS }
 };
 
 const clamp = (n: unknown, min: number, max: number, fallback: number): number =>
   typeof n === 'number' && Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+
+function sanitizeShortcuts(raw: Partial<ScriptShortcuts> | undefined, base: ScriptShortcuts): ScriptShortcuts {
+  // Start / Pause is fixed to Ctrl+Space; migrate any legacy Enter/custom toggleScroll binding.
+  const toggleScroll = DEFAULT_SCRIPT_SHORTCUTS.toggleScroll;
+  let stepUp = normalizeDisplayBinding(raw?.stepUp) ?? base.stepUp;
+  let stepDown = normalizeDisplayBinding(raw?.stepDown) ?? base.stepDown;
+
+  if (stepUp === toggleScroll) stepUp = DEFAULT_SCRIPT_SHORTCUTS.stepUp;
+  if (stepDown === toggleScroll || stepDown === stepUp) {
+    stepDown = DEFAULT_SCRIPT_SHORTCUTS.stepDown;
+  }
+  if (new Set([toggleScroll, stepUp, stepDown]).size !== 3) {
+    return { ...DEFAULT_SCRIPT_SHORTCUTS };
+  }
+  return { toggleScroll, stepUp, stepDown };
+}
 
 function sanitize(raw: Partial<Persisted>, base: Persisted): Persisted {
   const b = raw.bounds;
@@ -26,10 +45,13 @@ function sanitize(raw: Partial<Persisted>, base: Persisted): Persisted {
   return {
     script: typeof raw.script === 'string' ? raw.script.slice(0, 500_000) : base.script,
     privateNotes: typeof raw.privateNotes === 'boolean' ? raw.privateNotes : base.privateNotes,
-    speed: clamp(raw.speed, 10, 400, base.speed),
+    speed: clamp(raw.speed, 2, 100, base.speed),
     fontSize: clamp(raw.fontSize, 14, 120, base.fontSize),
     opacity: clamp(raw.opacity, 0.3, 1, base.opacity),
     theme: raw.theme === 'dark' || raw.theme === 'light' ? raw.theme : base.theme,
+    globalScriptControls:
+      typeof raw.globalScriptControls === 'boolean' ? raw.globalScriptControls : base.globalScriptControls,
+    shortcuts: sanitizeShortcuts(raw.shortcuts, base.shortcuts),
     bounds
   };
 }

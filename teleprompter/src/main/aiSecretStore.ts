@@ -2,7 +2,6 @@ import { safeStorage } from 'electron';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  AI_PROVIDER_PRESETS,
   type AiConfigPatch,
   type AiProviderId,
   type AiPublicConfig
@@ -11,6 +10,7 @@ import {
 interface StoredConfig {
   provider: AiProviderId;
   models: Partial<Record<AiProviderId, string>>;
+  modelModes: Partial<Record<AiProviderId, 'auto' | 'manual'>>;
   customBaseUrl: string;
 }
 
@@ -45,21 +45,33 @@ export class AiSecretStore {
     const fallback: StoredConfig = {
       provider: 'gemini',
       models: {},
+      modelModes: {},
       customBaseUrl: ''
     };
     try {
       const raw = JSON.parse(fs.readFileSync(this.configPath, 'utf8')) as Partial<StoredConfig>;
       const provider = isValidProvider(raw.provider) ? raw.provider : 'gemini';
       const models: Partial<Record<AiProviderId, string>> = {};
+      const modelModes: Partial<Record<AiProviderId, 'auto' | 'manual'>> = {};
       if (raw.models && typeof raw.models === 'object') {
         for (const id of VALID_PROVIDERS) {
           const val = raw.models[id];
-          if (typeof val === 'string') models[id] = val.trim().slice(0, 200);
+          if (typeof val === 'string') {
+            models[id] = val.trim().slice(0, 200);
+          }
+        }
+      }
+      if (raw.modelModes && typeof raw.modelModes === 'object') {
+        for (const id of VALID_PROVIDERS) {
+          const mode = raw.modelModes[id];
+          if (mode === 'auto' || mode === 'manual') {
+            modelModes[id] = mode;
+          }
         }
       }
       const customBaseUrl =
         typeof raw.customBaseUrl === 'string' ? raw.customBaseUrl.trim().slice(0, 500) : '';
-      return { provider, models, customBaseUrl };
+      return { provider, models, modelModes, customBaseUrl };
     } catch {
       return fallback;
     }
@@ -92,14 +104,19 @@ export class AiSecretStore {
   }
 
   getActiveModel(provider = this.config.provider): string {
-    const saved = this.config.models[provider];
-    if (saved && saved.length > 0) return saved;
-    return AI_PROVIDER_PRESETS[provider].defaultModel;
+    return this.config.models[provider] ?? '';
+  }
+
+  getModelMode(provider = this.config.provider): 'auto' | 'manual' {
+    const explicit = this.config.modelModes[provider];
+    if (explicit === 'auto' || explicit === 'manual') return explicit;
+    return this.getActiveModel(provider).length > 0 ? 'manual' : 'auto';
   }
 
   getPublicConfig(): AiPublicConfig {
     return {
       provider: this.config.provider,
+      modelMode: this.getModelMode(this.config.provider),
       model: this.getActiveModel(this.config.provider),
       customBaseUrl: this.config.customBaseUrl,
       hasKey: {
@@ -116,8 +133,18 @@ export class AiSecretStore {
     if (patch.provider !== undefined && isValidProvider(patch.provider)) {
       this.config.provider = patch.provider;
     }
+    if (patch.modelMode === 'auto') {
+      this.config.modelModes[this.config.provider] = 'auto';
+      this.config.models[this.config.provider] = '';
+    } else if (patch.modelMode === 'manual') {
+      this.config.modelModes[this.config.provider] = 'manual';
+    }
     if (typeof patch.model === 'string') {
-      this.config.models[this.config.provider] = patch.model.trim().slice(0, 200);
+      const trimmed = patch.model.trim().slice(0, 200);
+      this.config.models[this.config.provider] = trimmed;
+      if (patch.modelMode === undefined) {
+        this.config.modelModes[this.config.provider] = trimmed.length > 0 ? 'manual' : 'auto';
+      }
     }
     if (typeof patch.customBaseUrl === 'string') {
       this.config.customBaseUrl = patch.customBaseUrl.trim().slice(0, 500);

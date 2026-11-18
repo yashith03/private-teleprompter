@@ -17,14 +17,19 @@ import {
 import {
   AI_PROVIDER_PRESETS,
   type AiConfigPatch,
+  type AiModelListResult,
   type AiProviderId,
   type AiPublicConfig,
+  type DeepgramModelId,
   type Settings,
   type ShortcutAction,
   type ShortcutBindingStatus,
   type SttConfig,
+  type SttProviderId,
   type SttStatus
 } from '../shared/types';
+import { keyEventToDisplayBinding } from '../shared/shortcuts';
+import { CustomSelect, type CustomSelectOption } from './CustomSelect';
 import {
   CheckIcon, CloseIcon, EditIcon, MinimizeIcon, PauseIcon, PlayIcon, RestartIcon, SettingsIcon, ShieldIcon
 } from './icons';
@@ -34,13 +39,25 @@ export const STEP_PX = 80;
 type Patch = Partial<Omit<Settings, 'privateNotes'>>;
 type TopTab = 'script' | 'qa';
 
+function formatDurationHms(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
 export function App() {
   const [s, setS] = useState<Settings | null>(null);
   const [activeTab, setActiveTab] = useState<TopTab>('script');
   const [running, setRunning] = useState(false);
+  const [timerRunning, setTimerRunning] = useState(false);
+  const [timerElapsedMs, setTimerElapsedMs] = useState(0);
   const [editing, setEditing] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [shortcuts, setShortcuts] = useState<ShortcutBindingStatus[]>([]);
+  const timerAccumulatedMsRef = useRef(0);
+  const timerStartedAtRef = useRef<number | null>(null);
   const readerRef = useRef<HTMLDivElement>(null);
   const slideBarRef = useRef<HTMLDivElement>(null);
   const slideTrackRef = useRef<HTMLDivElement>(null);
@@ -54,6 +71,7 @@ export function App() {
   const runningRef = useRef(false);
   const editingRef = useRef(false);
   const activeTabRef = useRef<TopTab>('script');
+  const settingsOpenRef = useRef(false);
   const saveTimer = useRef<number | undefined>(undefined);
   const pending = useRef<Patch>({});
   const [scrubbing, setScrubbing] = useState(false);
@@ -69,22 +87,78 @@ export function App() {
   const [privacyPending, setPrivacyPending] = useState(false);
   const [aiConfig, setAiConfig] = useState<AiPublicConfig | null>(null);
   const [aiKeyDraft, setAiKeyDraft] = useState('');
-  const [aiListedModels, setAiListedModels] = useState<string[]>([]);
+  const [aiDiscovery, setAiDiscovery] = useState<AiModelListResult | null>(null);
+  const [aiDiscoveryLoading, setAiDiscoveryLoading] = useState(false);
   const [aiStatus, setAiStatus] = useState<{ ok: boolean; text: string } | null>(null);
   const [aiBusy, setAiBusy] = useState(false);
+  const [manualModelMode, setManualModelMode] = useState(false);
+  const aiDiscoverySeqRef = useRef(0);
+  const aiActiveSelectionRef = useRef<{ provider: AiProviderId; customBaseUrl: string }>({
+    provider: 'gemini',
+    customBaseUrl: ''
+  });
+  const aiUrlDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [sttConfig, setSttConfig] = useState<SttConfig | null>(null);
   const [sttStatus, setSttStatus] = useState<SttStatus | null>(null);
+  const [deepgramKeyDraft, setDeepgramKeyDraft] = useState('');
 
   const parsedSlides = useMemo(() => parseSlides(s?.script ?? ''), [s?.script]);
 
+  const refreshAiModels = useCallback(async (target?: AiPublicConfig, showStatus = false) => {
+    const seq = ++aiDiscoverySeqRef.current;
+    const expectedProvider = target?.provider ?? aiActiveSelectionRef.current.provider;
+    const expectedCustomUrl = (target?.customBaseUrl ?? aiActiveSelectionRef.current.customBaseUrl).trim();
+    setAiDiscoveryLoading(true);
+    try {
+      const res = await window.teleprompter.listAiModels();
+      if (seq !== aiDiscoverySeqRef.current) return;
+      if (
+        res.provider !== aiActiveSelectionRef.current.provider ||
+        (res.provider === 'custom' &&
+          expectedProvider === 'custom' &&
+          expectedCustomUrl &&
+          aiActiveSelectionRef.current.customBaseUrl.trim() !== expectedCustomUrl)
+      ) {
+        return;
+      }
+      setAiDiscovery(res);
+      if (showStatus) {
+        if (res.ok) {
+          const chatCount = res.models.filter((m) => m.capability === 'chat').length;
+          setAiStatus({ ok: true, text: `Discovered ${chatCount} chat model(s).` });
+        } else {
+          setAiStatus({
+            ok: false,
+            text: res.cached
+              ? `Using cached models (${res.error || 'refresh failed'}).`
+              : res.error || 'Could not list models.'
+          });
+        }
+      }
+    } finally {
+      if (seq === aiDiscoverySeqRef.current) {
+        setAiDiscoveryLoading(false);
+      }
+    }
+  }, []);
+
   useEffect(() => {
     void window.teleprompter.getSettings().then(setS);
-    void window.teleprompter.getAiConfig().then(setAiConfig);
+    void window.teleprompter.getAiConfig().then((cfg) => {
+      setAiConfig(cfg);
+      aiActiveSelectionRef.current = {
+        provider: cfg.provider,
+        customBaseUrl: cfg.customBaseUrl.trim()
+      };
+      if (cfg.hasKey[cfg.provider] || (cfg.provider === 'custom' && cfg.customBaseUrl.trim())) {
+        void refreshAiModels(cfg, false);
+      }
+    });
     void window.teleprompter.getSttConfig().then(setSttConfig);
     void window.teleprompter.getSttStatus().then(setSttStatus);
     void window.teleprompter.getShortcuts().then(setShortcuts);
     return window.teleprompter.onShortcutStatus(setShortcuts);
-  }, []);
+  }, [refreshAiModels]);
 
   const onSttConfigChange = useCallback(async (patch: Partial<SttConfig>) => {
     const updated = await window.teleprompter.updateSttConfig(patch);
@@ -92,10 +166,52 @@ export function App() {
     const status = await window.teleprompter.getSttStatus();
     setSttStatus(status);
   }, []);
+
+  const onSaveDeepgramKey = useCallback(async () => {
+    const trimmed = deepgramKeyDraft.trim();
+    if (!trimmed) return;
+    const updated = await window.teleprompter.setDeepgramApiKey(trimmed);
+    setSttConfig(updated);
+    setDeepgramKeyDraft('');
+    const status = await window.teleprompter.getSttStatus();
+    setSttStatus(status);
+  }, [deepgramKeyDraft]);
+
+  const onClearDeepgramKey = useCallback(async () => {
+    const updated = await window.teleprompter.clearDeepgramApiKey();
+    setSttConfig(updated);
+    setDeepgramKeyDraft('');
+    const status = await window.teleprompter.getSttStatus();
+    setSttStatus(status);
+  }, []);
   useEffect(() => { if (s) speedRef.current = s.speed; }, [s?.speed]);
   useEffect(() => { runningRef.current = running; }, [running]);
   useEffect(() => { editingRef.current = editing; }, [editing]);
   useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
+  useEffect(() => { settingsOpenRef.current = settingsOpen; }, [settingsOpen]);
+
+  const [capturingAction, setCapturingAction] = useState<ShortcutAction | null>(null);
+  const [shortcutError, setShortcutError] = useState<string | null>(null);
+  const shortcutsRef = useRef<ShortcutBindingStatus[]>([]);
+  const globalControlsRef = useRef(true);
+  const toggleBindingRef = useRef('Ctrl+Space');
+  useEffect(() => { shortcutsRef.current = shortcuts; }, [shortcuts]);
+  useEffect(() => { if (s) globalControlsRef.current = s.globalScriptControls; }, [s?.globalScriptControls]);
+  useEffect(() => { if (s) toggleBindingRef.current = s.shortcuts.toggleScroll; }, [s?.shortcuts?.toggleScroll]);
+
+  useEffect(() => {
+    if (!s) return;
+    void window.teleprompter
+      .setScriptReaderActive(activeTab === 'script' && !editing && !settingsOpen)
+      .then(setShortcuts);
+  }, [s !== null, activeTab, editing, settingsOpen]);
+
+  useEffect(() => {
+    if (!settingsOpen) {
+      setCapturingAction(null);
+      setShortcutError(null);
+    }
+  }, [settingsOpen]);
 
   // Debounced local save of everything except privateNotes (which has its own channel).
   // Pending patches are merged so rapid changes of different fields are not lost.
@@ -220,12 +336,23 @@ export function App() {
     }
   }, [progress.activeIndex]);
 
-  // Scrolling loop: time-based so speed is frame-rate independent; suspended while scrubbing.
-  useEffect(() => {
-    if (!running || editing || scrubbing) return;
+  // Preserve reader scroll position across hidden tab switches without advancing while hidden.
+  useLayoutEffect(() => {
+    if (activeTab !== 'script' || editing) return;
     const el = readerRef.current;
     if (!el) return;
-    posRef.current = el.scrollTop;
+    if (Math.abs(el.scrollTop - posRef.current) > 0.5) {
+      el.scrollTop = posRef.current;
+    }
+    syncProgressOnly(posRef.current);
+  }, [activeTab, editing, syncProgressOnly]);
+
+  // Scrolling loop: time-based so speed is frame-rate independent; suspended while scrubbing or on other tabs.
+  useEffect(() => {
+    if (!running || editing || scrubbing || activeTab !== 'script') return;
+    const el = readerRef.current;
+    if (!el) return;
+    el.scrollTop = posRef.current;
     let last = performance.now();
     let raf = 0;
     const tick = (now: number) => {
@@ -238,7 +365,43 @@ export function App() {
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [running, editing, scrubbing, syncProgressOnly]);
+  }, [running, editing, scrubbing, activeTab, syncProgressOnly]);
+
+  // Independent manual practice stopwatch driven by wall-clock timestamps.
+  useEffect(() => {
+    if (!timerRunning) return;
+    const syncElapsed = () => {
+      if (timerStartedAtRef.current === null) return;
+      const nextMs = timerAccumulatedMsRef.current + Math.max(0, Date.now() - timerStartedAtRef.current);
+      setTimerElapsedMs((prev) => (Math.floor(prev / 1000) === Math.floor(nextMs / 1000) ? prev : nextMs));
+    };
+    syncElapsed();
+    const id = window.setInterval(syncElapsed, 200);
+    return () => window.clearInterval(id);
+  }, [timerRunning]);
+
+  const handleTimerToggle = useCallback(() => {
+    if (timerRunning) {
+      const nextMs =
+        timerStartedAtRef.current !== null
+          ? timerAccumulatedMsRef.current + Math.max(0, Date.now() - timerStartedAtRef.current)
+          : timerAccumulatedMsRef.current;
+      timerAccumulatedMsRef.current = nextMs;
+      timerStartedAtRef.current = null;
+      setTimerElapsedMs(nextMs);
+      setTimerRunning(false);
+      return;
+    }
+    timerStartedAtRef.current = Date.now();
+    setTimerRunning(true);
+  }, [timerRunning]);
+
+  const handleTimerReset = useCallback(() => {
+    timerAccumulatedMsRef.current = 0;
+    timerStartedAtRef.current = null;
+    setTimerRunning(false);
+    setTimerElapsedMs(0);
+  }, []);
 
   const toggleRun = useCallback(() => {
     setEditing(false);
@@ -365,6 +528,7 @@ export function App() {
   }, [seekToClientX, jumpToSlide]);
 
   const onReaderScroll = useCallback(() => {
+    if (activeTabRef.current !== 'script') return;
     const el = readerRef.current;
     if (!el) return;
     if (!runningRef.current) posRef.current = el.scrollTop;
@@ -383,20 +547,54 @@ export function App() {
 
   useEffect(() => {
     return window.teleprompter.onShortcutAction((action: ShortcutAction) => {
+      if (action === 'toggle-scroll') {
+        toggleRun();
+        return;
+      }
       const active = document.activeElement as HTMLElement | null;
       if (active && (['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName) || active.isContentEditable)) {
         return;
       }
-      if (action === 'toggle-scroll') toggleRun();
-      else if (action === 'step-up') stepScroll(-STEP_PX);
+      if (action === 'step-up') stepScroll(-STEP_PX);
       else if (action === 'step-down') stepScroll(STEP_PX);
     });
-  }, [toggleRun, stepScroll]);
+  }, [stepScroll, toggleRun]);
 
-  // Space toggles scrolling, except while a control, modifier key, non-script tab, or editor is active
-  // (so Ctrl+Space never double-triggers and focused buttons/editor/chat input behave normally).
+  // Capture a new shortcut binding while Settings key-capture mode is active.
+  useEffect(() => {
+    if (!capturingAction) return;
+    const onCapture = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const res = keyEventToDisplayBinding(e);
+      if (res.cancel) {
+        setCapturingAction(null);
+        setShortcutError(null);
+        return;
+      }
+      if (res.ignore) return;
+      if (res.error || !res.binding) {
+        setShortcutError(res.error || 'Unsupported key for shortcut.');
+        setCapturingAction(null);
+        return;
+      }
+      const action = capturingAction;
+      setCapturingAction(null);
+      void window.teleprompter.updateShortcutBinding(action, res.binding).then((out) => {
+        setS(out.settings);
+        setShortcuts(out.status);
+        setShortcutError(out.ok ? null : (out.error || 'Could not assign shortcut.'));
+      });
+    };
+    window.addEventListener('keydown', onCapture, true);
+    return () => window.removeEventListener('keydown', onCapture, true);
+  }, [capturingAction]);
+
+  // Block plain Space from scrolling the reader (while preserving Space in text fields and on buttons),
+  // and handle local Ctrl+Space when global registration is off or unavailable.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (capturingAction) return;
       if (e.key === 'Escape') {
         setSettingsOpen((open) => {
           if (open) gearRef.current?.focus();
@@ -404,18 +602,46 @@ export function App() {
         });
         return;
       }
+      const t = e.target;
+      const inEditable =
+        t instanceof HTMLElement &&
+        (['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName) ||
+          t.isContentEditable ||
+          Boolean(t.closest('[role="combobox"], [role="listbox"], [role="option"]')));
+      const isButton = t instanceof HTMLElement && Boolean(t.closest('button, [role="button"]'));
+
       if (
-        e.code !== 'Space' || e.repeat || e.ctrlKey || e.altKey || e.metaKey || e.shiftKey ||
-        editingRef.current || activeTabRef.current !== 'script'
-      ) return;
-      const t = e.target as HTMLElement | null;
-      if (t && (['BUTTON', 'INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName) || t.isContentEditable)) return;
+        (e.code === 'Space' || e.key === ' ') &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        !e.shiftKey &&
+        !e.metaKey
+      ) {
+        if (!inEditable && !isButton) e.preventDefault();
+        return;
+      }
+
+      if (e.repeat) return;
+
+      const isCtrlSpace =
+        e.ctrlKey &&
+        !e.altKey &&
+        !e.shiftKey &&
+        !e.metaKey &&
+        (e.code === 'Space' || e.key === ' ');
+      if (!isCtrlSpace) return;
+
+      const globalToggleRegistered =
+        globalControlsRef.current &&
+        Boolean(shortcutsRef.current.find((item) => item.action === 'toggle-scroll')?.registered);
+      if (globalToggleRegistered) return;
+
       e.preventDefault();
       toggleRun();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [toggleRun]);
+  }, [toggleRun, capturingAction]);
 
   // Click outside closes the popover.
   useEffect(() => {
@@ -463,12 +689,31 @@ export function App() {
   const onAiConfigChange = useCallback(async (patch: AiConfigPatch) => {
     const next = await window.teleprompter.updateAiConfig(patch);
     setAiConfig(next);
+    aiActiveSelectionRef.current = {
+      provider: next.provider,
+      customBaseUrl: next.customBaseUrl.trim()
+    };
     if (patch.provider !== undefined) {
-      setAiListedModels([]);
+      aiDiscoverySeqRef.current += 1;
+      setAiDiscovery(null);
+      setAiDiscoveryLoading(false);
       setAiKeyDraft('');
       setAiStatus(null);
+      setManualModelMode(false);
+      if (next.hasKey[next.provider] || (next.provider === 'custom' && next.customBaseUrl.trim())) {
+        void refreshAiModels(next, false);
+      }
+    } else if (patch.customBaseUrl !== undefined) {
+      aiDiscoverySeqRef.current += 1;
+      setAiDiscovery(null);
+      if (aiUrlDebounceRef.current) clearTimeout(aiUrlDebounceRef.current);
+      if (next.customBaseUrl.trim()) {
+        aiUrlDebounceRef.current = setTimeout(() => {
+          void refreshAiModels(next, false);
+        }, 350);
+      }
     }
-  }, []);
+  }, [refreshAiModels]);
 
   const onSaveAiKey = useCallback(async () => {
     if (!aiConfig || aiBusy) return;
@@ -486,12 +731,15 @@ export function App() {
             : 'API key stored in memory for this session.'
           : 'API key cleared.'
       });
+      if (next.hasKey[next.provider] || (next.provider === 'custom' && next.customBaseUrl.trim())) {
+        void refreshAiModels(next, false);
+      }
     } catch (err) {
       setAiStatus({ ok: false, text: err instanceof Error ? err.message : 'Failed to save API key.' });
     } finally {
       setAiBusy(false);
     }
-  }, [aiConfig, aiKeyDraft, aiBusy]);
+  }, [aiConfig, aiKeyDraft, aiBusy, refreshAiModels]);
 
   const onClearAiKey = useCallback(async () => {
     if (!aiConfig || aiBusy) return;
@@ -501,6 +749,7 @@ export function App() {
       const next = await window.teleprompter.clearAiApiKey(aiConfig.provider);
       setAiConfig(next);
       setAiKeyDraft('');
+      setAiDiscovery(null);
       setAiStatus({ ok: true, text: 'API key cleared.' });
     } finally {
       setAiBusy(false);
@@ -508,21 +757,10 @@ export function App() {
   }, [aiConfig, aiBusy]);
 
   const onListAiModels = useCallback(async () => {
-    if (aiBusy) return;
-    setAiBusy(true);
+    if (aiBusy || aiDiscoveryLoading) return;
     setAiStatus(null);
-    try {
-      const res = await window.teleprompter.listAiModels();
-      if (res.ok) {
-        setAiListedModels(res.models);
-        setAiStatus({ ok: true, text: `Loaded ${res.models.length} model(s).` });
-      } else {
-        setAiStatus({ ok: false, text: res.error || 'Could not list models.' });
-      }
-    } finally {
-      setAiBusy(false);
-    }
-  }, [aiBusy]);
+    await refreshAiModels(aiConfig ?? undefined, true);
+  }, [aiBusy, aiDiscoveryLoading, refreshAiModels, aiConfig]);
 
   const onTestAiConnection = useCallback(async () => {
     if (aiBusy) return;
@@ -531,14 +769,16 @@ export function App() {
     try {
       const res = await window.teleprompter.testAiConnection();
       if (res.ok) {
-        setAiStatus({ ok: true, text: `Connected (${res.latencyMs ?? 0}ms): ${res.replyPreview ?? 'OK'}` });
+        const modelInfo = res.resolvedModel ? ` · ${res.resolvedModel}` : '';
+        setAiStatus({ ok: true, text: `Connected (${res.latencyMs ?? 0}ms${modelInfo}): ${res.replyPreview ?? 'OK'}` });
+        void refreshAiModels(aiConfig ?? undefined, false);
       } else {
         setAiStatus({ ok: false, text: res.error || 'Connection failed.' });
       }
     } finally {
       setAiBusy(false);
     }
-  }, [aiBusy]);
+  }, [aiBusy, aiConfig, refreshAiModels]);
 
   if (!s) return <div className="loading">Loading...</div>;
 
@@ -549,20 +789,13 @@ export function App() {
     syncProgressOnly(0);
   };
 
-  const toggleShortcut = shortcuts.find((item) => item.action === 'toggle-scroll');
-  const toggleHint = toggleShortcut?.registered === false
-    ? 'Ctrl+Space unavailable'
-    : 'Ctrl+Space / Space';
-
-  const privacyLabel = s.privateNotes
-    ? 'Private notes on: hidden from supported full-display capture.'
-    : 'Private notes off: visible in screen sharing and recordings.';
-
   const theme = s.theme === 'dark' ? 'dark' : 'light';
   const slideCount = parsedSlides.sections.length;
   const activeIdx = progress.activeIndex >= 0 ? progress.activeIndex : 0;
   const activeFill = slideCount > 0 ? (progress.fills[activeIdx] ?? 0) : 0;
   const playheadPct = slideCount > 0 ? Math.min(100, Math.max(0, ((activeIdx + activeFill) / slideCount) * 100)) : 0;
+
+  const timerToggleLabel = timerRunning ? 'Pause Timer' : timerElapsedMs > 0 ? 'Resume Timer' : 'Start Timer';
 
   return (
     <div className="shell">
@@ -573,7 +806,6 @@ export function App() {
       >
         <header className="bar">
           <div
-            title={privacyLabel}
             data-testid="privacy-badge-container"
             className={`privacy ${s.privateNotes ? 'on' : 'off'}`}
             aria-live="polite"
@@ -609,12 +841,39 @@ export function App() {
             </button>
           </div>
           <span className="spacer" />
+          <div
+            className={`top-timer ${timerRunning ? 'running' : timerElapsedMs > 0 ? 'paused' : ''}`}
+            data-testid="top-timer"
+          >
+            <button
+              type="button"
+              className="top-timer-toggle"
+              data-testid="timer-toggle"
+              aria-label={timerToggleLabel}
+              onClick={handleTimerToggle}
+            >
+              {timerRunning ? <PauseIcon /> : <PlayIcon />}
+              <span className="top-timer-label">{timerToggleLabel}</span>
+            </button>
+            <span className="top-timer-clock" data-testid="timer-display" aria-label="Practice timer">
+              {formatDurationHms(timerElapsedMs)}
+            </span>
+            <button
+              type="button"
+              className="top-timer-reset"
+              data-testid="timer-reset"
+              aria-label="Reset Timer"
+              disabled={!timerRunning && timerElapsedMs === 0}
+              onClick={handleTimerReset}
+            >
+              <RestartIcon />
+            </button>
+          </div>
           <button
             type="button"
             className="icon-btn"
             data-testid="minimize"
             aria-label="Minimize"
-            title="Minimize"
             onClick={() => void window.teleprompter.minimize()}
           >
             <MinimizeIcon />
@@ -624,7 +883,6 @@ export function App() {
             className="icon-btn"
             data-testid="close"
             aria-label="Quit teleprompter"
-            title="Quit"
             onClick={() => window.teleprompter.quit()}
           >
             <CloseIcon />
@@ -667,7 +925,6 @@ export function App() {
                         data-active={isActive ? 'true' : 'false'}
                         aria-current={isActive ? 'step' : undefined}
                         aria-label={segLabel}
-                        title={segLabel}
                         className={`slide-seg ${stateClass}`}
                         onClick={() => {
                           if (handledPointerUpRef.current) return;
@@ -778,7 +1035,6 @@ export function App() {
             data-testid="toggle"
             className="btn-primary"
             aria-label={running ? 'Pause scrolling' : 'Start scrolling'}
-            title={running ? `Pause (${toggleHint})` : `Start (${toggleHint})`}
             onClick={toggleRun}
           >
             {running ? <PauseIcon /> : <PlayIcon />}
@@ -789,7 +1045,6 @@ export function App() {
             data-testid="restart"
             className="icon-btn"
             aria-label="Restart from the top"
-            title="Restart"
             onClick={restart}
           >
             <RestartIcon />
@@ -800,7 +1055,6 @@ export function App() {
             className={`icon-btn ${editing ? 'active' : ''}`}
             aria-label={editing ? 'Finish editing' : 'Edit script'}
             aria-pressed={editing}
-            title={editing ? 'Done editing' : 'Edit script'}
             onClick={() => { setRunning(false); setEditing((v) => !v); }}
           >
             {editing ? <CheckIcon /> : <EditIcon />}
@@ -814,7 +1068,6 @@ export function App() {
             aria-label="Settings"
             aria-haspopup="dialog"
             aria-expanded={settingsOpen}
-            title="Settings"
             onClick={() => setSettingsOpen((o) => !o)}
           >
             <SettingsIcon />
@@ -825,6 +1078,11 @@ export function App() {
         <div className="tab-panel" data-testid="qa-panel-wrap" hidden={activeTab !== 'qa'}>
           <QaPanel
             aiConfig={aiConfig}
+            resolvedAutoModel={
+              aiDiscovery && aiDiscovery.provider === aiConfig?.provider
+                ? aiDiscovery.recommended[0] ?? null
+                : null
+            }
             currentScript={s.script}
             isQaTabActive={activeTab === 'qa'}
             sttConfig={sttConfig}
@@ -843,21 +1101,21 @@ export function App() {
           hidden={!settingsOpen}
         >
           <label className="row">
-            <span>Speed</span>
-            <input data-testid="speed" type="range" min={10} max={300} step={5} value={s.speed}
-              aria-label="Scroll speed" title="Scroll speed"
+            <span>Speed <em className="row-val" data-testid="speed-value">{s.speed}</em></span>
+            <input data-testid="speed" type="range" min={2} max={100} step={1} value={s.speed}
+              aria-label="Scroll speed"
               onChange={(e) => change({ speed: Number(e.target.value) })} />
           </label>
           <label className="row">
             <span>Font</span>
             <input data-testid="font" type="range" min={16} max={96} step={2} value={s.fontSize}
-              aria-label="Font size" title="Font size"
+              aria-label="Font size"
               onChange={(e) => change({ fontSize: Number(e.target.value) })} />
           </label>
           <label className="row">
             <span>Background</span>
             <input data-testid="opacity" type="range" min={0.3} max={1} step={0.05} value={s.opacity}
-              aria-label="Background opacity" title="Background opacity (script text stays fully opaque)"
+              aria-label="Background opacity"
               onChange={(e) => change({ opacity: Number(e.target.value) })} />
           </label>
           <div className="row">
@@ -867,7 +1125,6 @@ export function App() {
               role="switch"
               aria-checked={s.privateNotes}
               aria-label="Private notes"
-              title="Toggle Private notes protection"
               data-testid="privacy-toggle"
               className={`theme-switch ${s.privateNotes ? 'on' : 'off'}`}
               disabled={privacyPending}
@@ -888,7 +1145,6 @@ export function App() {
               role="switch"
               aria-checked={theme === 'dark'}
               aria-label="Theme"
-              title="Switch between Light and Dark themes"
               data-testid="theme-toggle"
               className={`theme-switch ${theme}`}
               onClick={() => change({ theme: theme === 'dark' ? 'light' : 'dark' })}
@@ -896,34 +1152,102 @@ export function App() {
               {theme === 'dark' ? 'Dark' : 'Light'}
             </button>
           </div>
-          <div className="shortcuts" data-testid="shortcuts-list" aria-label="Global shortcuts">
-            <div className="shortcuts-title">Global shortcuts</div>
-            {shortcuts.map((item) => (
-              <div key={item.action} className="shortcut-row" data-testid={`shortcut-${item.action}`}>
-                <span>{item.description}</span>
-                <span className={`kbd ${item.registered ? '' : 'unavailable'}`}>
-                  {item.registered ? item.accelerator : `${item.accelerator} (Unavailable)`}
-                </span>
+          <div className="shortcuts" data-testid="shortcuts-list" aria-label="Shortcuts">
+            <div className="shortcuts-header">
+              <div className="shortcuts-title">Script Controls</div>
+              <button
+                type="button"
+                className="shortcut-reset-btn"
+                data-testid="shortcuts-reset"
+                onClick={() => {
+                  setCapturingAction(null);
+                  setShortcutError(null);
+                  void window.teleprompter.resetShortcutBindings().then((out) => {
+                    setS(out.settings);
+                    setShortcuts(out.status);
+                  });
+                }}
+              >
+                Reset
+              </button>
+            </div>
+            <div className="row">
+              <span>Global shortcuts</span>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={s.globalScriptControls}
+                aria-label="Global Script Controls"
+                data-testid="global-shortcuts-switch"
+                className={`theme-switch ${s.globalScriptControls ? 'on' : 'off'}`}
+                onClick={() => {
+                  const nextVal = !s.globalScriptControls;
+                  setS((cur) => (cur ? { ...cur, globalScriptControls: nextVal } : cur));
+                  void window.teleprompter.updateSettings({ globalScriptControls: nextVal });
+                }}
+              >
+                {s.globalScriptControls ? 'ON' : 'OFF'}
+              </button>
+            </div>
+            {shortcuts.map((item) => {
+              const isCapturing = capturingAction === item.action;
+              const isFixedToggle = item.action === 'toggle-scroll';
+              return (
+                <div key={item.action} className="shortcut-row" data-testid={`shortcut-${item.action}`}>
+                  <span>{item.description}</span>
+                  {isFixedToggle ? (
+                    <span className="kbd" data-testid={`shortcut-bind-${item.action}`}>
+                      {item.accelerator}
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      data-testid={`shortcut-bind-${item.action}`}
+                      className={`kbd shortcut-bind-btn ${isCapturing ? 'capturing' : ''}`}
+                      onClick={() => {
+                        setShortcutError(null);
+                        setCapturingAction(isCapturing ? null : item.action);
+                      }}
+                    >
+                      {isCapturing ? 'Press key...' : item.accelerator}
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+            {shortcutError && (
+              <div className="shortcut-error" data-testid="shortcut-error" role="status">
+                {shortcutError}
               </div>
-            ))}
+            )}
+            {s.globalScriptControls &&
+              shortcuts.some((item) => item.action === 'toggle-scroll' && !item.registered) && (
+                <div className="shortcut-error" data-testid="shortcut-unavailable-note" role="status">
+                  Ctrl+Space is unavailable globally (already in use by another app). Use the Start / Pause button or press Ctrl+Space while focused.
+                </div>
+              )}
+            {s.globalScriptControls && (
+              <div className="shortcut-note" data-testid="shortcut-global-note">
+                Ctrl+Space works globally while open and unminimised, and is released when minimised or quit.
+              </div>
+            )}
           </div>
           {aiConfig && (
             <div className="ai-settings" data-testid="ai-settings" aria-label="AI Provider">
               <div className="shortcuts-title">AI Provider</div>
-              <label className="row">
+              <div className="row">
                 <span>Provider</span>
-                <select
-                  className="ai-select"
-                  data-testid="ai-provider"
-                  aria-label="AI Provider"
+                <CustomSelect
+                  testId="ai-provider"
+                  ariaLabel="AI Provider"
                   value={aiConfig.provider}
-                  onChange={(e) => void onAiConfigChange({ provider: e.target.value as AiProviderId })}
-                >
-                  {(Object.keys(AI_PROVIDER_PRESETS) as AiProviderId[]).map((id) => (
-                    <option key={id} value={id}>{AI_PROVIDER_PRESETS[id].label}</option>
-                  ))}
-                </select>
-              </label>
+                  onChange={(val) => void onAiConfigChange({ provider: val as AiProviderId })}
+                  options={(Object.keys(AI_PROVIDER_PRESETS) as AiProviderId[]).map((id) => ({
+                    value: id,
+                    label: AI_PROVIDER_PRESETS[id].label
+                  }))}
+                />
+              </div>
               {aiConfig.provider === 'custom' && (
                 <label className="ai-field">
                   <span>Endpoint URL</span>
@@ -945,41 +1269,146 @@ export function App() {
                     type="button"
                     className="ai-mini-btn"
                     data-testid="ai-list-models"
-                    disabled={aiBusy}
+                    disabled={aiBusy || aiDiscoveryLoading}
                     onClick={() => void onListAiModels()}
                   >
-                    List
+                    {aiDiscoveryLoading ? 'Refreshing...' : 'Refresh'}
                   </button>
                 </div>
-                <select
-                  className="ai-select full"
-                  data-testid="ai-model-select"
-                  aria-label="Select model"
-                  value={aiConfig.model}
-                  onChange={(e) => void onAiConfigChange({ model: e.target.value })}
-                >
-                  {Array.from(
-                    new Set([
-                      ...AI_PROVIDER_PRESETS[aiConfig.provider].suggestedModels,
-                      ...aiListedModels,
-                      ...(aiConfig.model ? [aiConfig.model] : [])
-                    ])
-                  ).map((m) => (
-                    <option key={m} value={m}>{m}</option>
-                  ))}
-                  {AI_PROVIDER_PRESETS[aiConfig.provider].suggestedModels.length === 0 &&
-                    aiListedModels.length === 0 &&
-                    !aiConfig.model && <option value="">Enter model ID below</option>}
-                </select>
-                <input
-                  type="text"
-                  className="ai-text-input"
-                  data-testid="ai-model-input"
-                  aria-label="Manual Model ID"
-                  placeholder="Manual Model ID"
-                  value={aiConfig.model}
-                  onChange={(e) => void onAiConfigChange({ model: e.target.value })}
-                />
+                {(() => {
+                  const activeDiscovery =
+                    aiDiscovery && aiDiscovery.provider === aiConfig.provider ? aiDiscovery : null;
+                  const discoveredSelectable = (activeDiscovery?.models ?? []).filter(
+                    (m) => m.capability !== 'excluded'
+                  );
+                  const recommendedIds = activeDiscovery?.recommended ?? [];
+                  const recommendedModels = recommendedIds
+                    .map((id) => discoveredSelectable.find((m) => m.id === id))
+                    .filter((m): m is NonNullable<typeof m> => Boolean(m))
+                    .slice(0, 3);
+                  const topRec = recommendedModels[0];
+                  const savedModel = aiConfig.model.trim();
+                  const savedInDiscovered =
+                    Boolean(savedModel) && discoveredSelectable.some((m) => m.id === savedModel);
+                  const isRetiredSavedModel =
+                    aiConfig.modelMode === 'manual' &&
+                    Boolean(savedModel) &&
+                    !savedInDiscovered &&
+                    Boolean(
+                      activeDiscovery &&
+                        activeDiscovery.ok &&
+                        !activeDiscovery.cached &&
+                        activeDiscovery.supportsDiscovery
+                    );
+                  const selectValue = manualModelMode
+                    ? '__manual__'
+                    : aiConfig.modelMode === 'auto'
+                      ? '__auto__'
+                      : savedModel || '__auto__';
+
+                  const modelOptions: CustomSelectOption[] = [
+                    {
+                      value: '__auto__',
+                      label: topRec
+                        ? `Auto · Fast recommended (${topRec.id} · ${topRec.speedNote})`
+                        : 'Auto · Fast recommended'
+                    },
+                    ...recommendedModels.map((m) => ({
+                      value: m.id,
+                      label: `${m.id} · ${m.speedNote}`,
+                      group: 'Recommended (fast Q&A)'
+                    })),
+                    ...discoveredSelectable.map((m) => ({
+                      value: m.id,
+                      label:
+                        m.capability === 'unknown'
+                          ? `${m.id} (unverified capabilities)`
+                          : `${m.id}${m.observedFirstTokenMs ? ` (${m.observedFirstTokenMs}ms)` : ''}`,
+                      group: 'All models'
+                    })),
+                    ...(aiConfig.modelMode === 'manual' && savedModel && !savedInDiscovered
+                      ? [
+                          {
+                            value: savedModel,
+                            label: isRetiredSavedModel
+                              ? `${savedModel} (Unavailable / retired)`
+                              : `${savedModel} (saved)`
+                          }
+                        ]
+                      : []),
+                    { value: '__manual__', label: 'Enter model ID manually' }
+                  ];
+
+                  return (
+                    <>
+                      <CustomSelect
+                        fullWidth
+                        testId="ai-model-select"
+                        ariaLabel="Select model"
+                        value={selectValue}
+                        options={modelOptions}
+                        onChange={(val) => {
+                          if (val === '__manual__') {
+                            setManualModelMode(true);
+                          } else if (val === '__auto__') {
+                            setManualModelMode(false);
+                            void onAiConfigChange({ modelMode: 'auto', model: '' });
+                          } else {
+                            setManualModelMode(false);
+                            void onAiConfigChange({ modelMode: 'manual', model: val });
+                          }
+                        }}
+                      />
+                      {isRetiredSavedModel && (
+                        <div className="ai-status err" data-testid="ai-model-retired">
+                          <span>
+                            Saved model &ldquo;{savedModel}&rdquo; was not found in the live{' '}
+                            {AI_PROVIDER_PRESETS[aiConfig.provider].label} catalog.
+                          </span>{' '}
+                          <button
+                            type="button"
+                            className="ai-mini-btn"
+                            data-testid="ai-model-replace-btn"
+                            onClick={() => {
+                              setManualModelMode(false);
+                              if (topRec) {
+                                void onAiConfigChange({ modelMode: 'manual', model: topRec.id });
+                              } else {
+                                void onAiConfigChange({ modelMode: 'auto', model: '' });
+                              }
+                            }}
+                          >
+                            {topRec ? `Use ${topRec.id}` : 'Switch to Auto'}
+                          </button>
+                        </div>
+                      )}
+                      {activeDiscovery && !activeDiscovery.supportsDiscovery && (
+                        <div className="ai-status" data-testid="ai-discovery-note">
+                          Endpoint does not support /models discovery — enter a model ID manually and use Test Connection.
+                        </div>
+                      )}
+                      {activeDiscovery && activeDiscovery.cached && (
+                        <div className="ai-status" data-testid="ai-discovery-cached">
+                          Cached list · {activeDiscovery.error || 'Refresh failed'}
+                        </div>
+                      )}
+                    </>
+                  );
+                })()}
+                {manualModelMode && (
+                  <label className="ai-field">
+                    <span>Manual Model ID</span>
+                    <input
+                      type="text"
+                      className="ai-text-input"
+                      data-testid="ai-model-input"
+                      aria-label="Manual Model ID"
+                      placeholder="Enter model ID..."
+                      value={aiConfig.model}
+                      onChange={(e) => void onAiConfigChange({ modelMode: 'manual', model: e.target.value })}
+                    />
+                  </label>
+                )}
               </div>
               <div className="ai-field">
                 <span>API Key</span>
@@ -1037,54 +1466,131 @@ export function App() {
           )}
           {sttConfig && (
             <div className="settings-ai-section" data-testid="stt-settings">
-              <div className="settings-ai-title">Voice / Whisper (Local)</div>
+              <div className="settings-ai-title">Voice / Speech-to-Text</div>
+              <div className="row">
+                <span>Speech-to-text</span>
+                <CustomSelect
+                  testId="stt-provider"
+                  ariaLabel="Speech-to-text provider"
+                  value={sttConfig.provider}
+                  onChange={(val) => void onSttConfigChange({ provider: val as SttProviderId })}
+                  options={[
+                    { value: 'whisper', label: 'Local Whisper' },
+                    { value: 'deepgram', label: 'Deepgram' }
+                  ]}
+                />
+              </div>
+              {sttConfig.provider === 'deepgram' && (
+                <div className="qa-disclosure" data-testid="stt-deepgram-notice">
+                  Audio is sent to Deepgram.
+                </div>
+              )}
               <div className="row">
                 <span>Auto-listen in AI Q&amp;A</span>
                 <button
                   type="button"
                   role="switch"
                   aria-checked={sttConfig.autoListen}
+                  aria-label="Auto-listen in AI Q&A"
                   data-testid="stt-autolisten-toggle"
-                  className={`switch ${sttConfig.autoListen ? 'on' : ''}`}
+                  className={`theme-switch ${sttConfig.autoListen ? 'on' : 'off'}`}
                   onClick={() => void onSttConfigChange({ autoListen: !sttConfig.autoListen })}
-                />
+                >
+                  {sttConfig.autoListen ? 'ON' : 'OFF'}
+                </button>
               </div>
-              <div className="ai-field">
+              <label className="ai-field">
                 <span>Language</span>
                 <input
                   type="text"
                   className="ai-text-input"
                   data-testid="stt-language"
-                  aria-label="Whisper language"
+                  aria-label="Speech language"
                   placeholder="en"
                   value={sttConfig.language}
                   onChange={(e) => void onSttConfigChange({ language: e.target.value })}
                 />
-              </div>
-              <div className="ai-field">
-                <span>Whisper Model (.bin)</span>
-                <input
-                  type="text"
-                  className="ai-text-input"
-                  data-testid="stt-model-path"
-                  aria-label="Whisper model path"
-                  placeholder="Path to ggml-*.bin"
-                  value={sttConfig.modelPath}
-                  onChange={(e) => void onSttConfigChange({ modelPath: e.target.value })}
-                />
-              </div>
-              <div className="ai-field">
-                <span>whisper.cpp Binary</span>
-                <input
-                  type="text"
-                  className="ai-text-input"
-                  data-testid="stt-binary-path"
-                  aria-label="whisper.cpp binary path"
-                  placeholder="Path to whisper-cli.exe"
-                  value={sttConfig.binaryPath}
-                  onChange={(e) => void onSttConfigChange({ binaryPath: e.target.value })}
-                />
-              </div>
+              </label>
+              {sttConfig.provider === 'deepgram' ? (
+                <>
+                  <div className="ai-field">
+                    <span>Deepgram Model</span>
+                    <CustomSelect
+                      fullWidth
+                      testId="stt-deepgram-model"
+                      ariaLabel="Deepgram model"
+                      value={sttConfig.deepgramModel}
+                      onChange={(val) =>
+                        void onSttConfigChange({ deepgramModel: val as DeepgramModelId })
+                      }
+                      options={[
+                        { value: 'flux-general-en', label: 'Flux English (flux-general-en)' },
+                        { value: 'nova-3', label: 'Nova-3 (nova-3)' }
+                      ]}
+                    />
+                  </div>
+                  <div className="ai-field">
+                    <span>Deepgram API Key</span>
+                    <div className="ai-key-row">
+                      <input
+                        type="password"
+                        className="ai-text-input"
+                        data-testid="stt-deepgram-key-input"
+                        aria-label="Deepgram API Key"
+                        placeholder={sttConfig.hasDeepgramKey ? 'Saved (encrypted)' : 'Enter Deepgram key...'}
+                        value={deepgramKeyDraft}
+                        onChange={(e) => setDeepgramKeyDraft(e.target.value)}
+                      />
+                      <button
+                        type="button"
+                        className="ai-mini-btn"
+                        data-testid="stt-deepgram-key-save"
+                        disabled={!deepgramKeyDraft.trim()}
+                        onClick={() => void onSaveDeepgramKey()}
+                      >
+                        Save
+                      </button>
+                      {sttConfig.hasDeepgramKey && (
+                        <button
+                          type="button"
+                          className="ai-mini-btn"
+                          data-testid="stt-deepgram-key-clear"
+                          onClick={() => void onClearDeepgramKey()}
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <label className="ai-field">
+                    <span>Whisper executable (.exe)</span>
+                    <input
+                      type="text"
+                      className="ai-text-input"
+                      data-testid="stt-binary-path"
+                      aria-label="Whisper executable (.exe)"
+                      placeholder="Path to whisper-cli.exe"
+                      value={sttConfig.binaryPath}
+                      onChange={(e) => void onSttConfigChange({ binaryPath: e.target.value })}
+                    />
+                  </label>
+                  <label className="ai-field">
+                    <span>Whisper model (.bin)</span>
+                    <input
+                      type="text"
+                      className="ai-text-input"
+                      data-testid="stt-model-path"
+                      aria-label="Whisper model (.bin)"
+                      placeholder="Path to ggml-*.bin"
+                      value={sttConfig.modelPath}
+                      onChange={(e) => void onSttConfigChange({ modelPath: e.target.value })}
+                    />
+                  </label>
+                </>
+              )}
               {sttStatus && !sttStatus.available && sttStatus.reason && (
                 <div className="ai-test-status err" data-testid="stt-status-reason">
                   {sttStatus.reason}
@@ -1096,7 +1602,6 @@ export function App() {
             type="button"
             data-testid="reopen"
             className="btn-secondary"
-            title="Recreate the overlay window using saved settings"
             onClick={() => void window.teleprompter.reopenOverlay()}
           >
             Reopen overlay
@@ -1107,7 +1612,6 @@ export function App() {
           className="grip"
           role="separator"
           aria-label="Resize"
-          title="Drag to resize"
           onPointerDown={onGripDown}
           onPointerMove={onGripMove}
           onPointerUp={onGripUp}

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, globalShortcut, ipcMain, screen, type IpcMainInvokeEvent } from 'electron';
+import { app, BrowserWindow, desktopCapturer, globalShortcut, ipcMain, screen, session, type IpcMainInvokeEvent } from 'electron';
 import path from 'node:path';
 import { SettingsStore } from './settingsStore';
 import type {
@@ -7,11 +7,19 @@ import type {
   AiProviderId,
   AiSendMessageInput,
   QaKnowledgePatch,
+  ScriptShortcuts,
   Settings,
   ShortcutAction,
   ShortcutBindingStatus,
+  ShortcutUpdateResult,
   SttConfig
 } from '../shared/types';
+import {
+  containsSpaceKey,
+  DEFAULT_SCRIPT_SHORTCUTS,
+  normalizeDisplayBinding,
+  toElectronAccelerator
+} from '../shared/shortcuts';
 import { runSelfTest } from './selftest';
 import { applyWindowsTaskbarPreviewProtection } from './windowsPreview';
 import { AiSecretStore } from './aiSecretStore';
@@ -20,12 +28,15 @@ import { QaKnowledgeStore } from './qaKnowledge';
 import { WhisperSttService } from './whisperStt';
 
 const SELFTEST = process.env.TELEPROMPTER_SELFTEST === '1';
+const E2E_USER_DATA = process.env.TELEPROMPTER_E2E_USER_DATA;
 if (SELFTEST) {
   app.setPath('userData', path.join(app.getPath('temp'), `teleprompter-selftest-${Date.now()}`));
+} else if (E2E_USER_DATA) {
+  app.setPath('userData', E2E_USER_DATA);
 }
 
 // Single instance: a second double-click focuses the running overlay instead of opening another.
-const gotLock = SELFTEST || app.requestSingleInstanceLock();
+const gotLock = SELFTEST || Boolean(E2E_USER_DATA) || app.requestSingleInstanceLock();
 if (!gotLock) app.quit();
 
 let store: SettingsStore;
@@ -37,45 +48,59 @@ let overlay: BrowserWindow | null = null;
 /** Ordered log of main-process window events, used by the self-test. */
 export const eventLog: string[] = [];
 
-const SHORTCUT_SPECS: ReadonlyArray<{
-  electronAccelerator: string;
-  displayAccelerator: ShortcutBindingStatus['accelerator'];
+const SHORTCUT_META: ReadonlyArray<{
   action: ShortcutAction;
+  field: keyof ScriptShortcuts;
   description: string;
 }> = [
-  { electronAccelerator: 'Control+Space', displayAccelerator: 'Ctrl+Space', action: 'toggle-scroll', description: 'Start / Pause' },
-  { electronAccelerator: 'Control+Up', displayAccelerator: 'Ctrl+Up', action: 'step-up', description: 'Step up' },
-  { electronAccelerator: 'Control+Down', displayAccelerator: 'Ctrl+Down', action: 'step-down', description: 'Step down' }
+  { action: 'toggle-scroll', field: 'toggleScroll', description: 'Start / Pause' },
+  { action: 'step-up', field: 'stepUp', description: 'Step up' },
+  { action: 'step-down', field: 'stepDown', description: 'Step down' }
 ];
 
-const VALID_SHORTCUT_ACTIONS = new Set<ShortcutAction>(SHORTCUT_SPECS.map((s) => s.action));
-let shortcutStatus: ShortcutBindingStatus[] = SHORTCUT_SPECS.map((s) => ({
+const VALID_SHORTCUT_ACTIONS = new Set<ShortcutAction>(SHORTCUT_META.map((s) => s.action));
+let scriptReaderActive = true;
+let shortcutStatus: ShortcutBindingStatus[] = SHORTCUT_META.map((s) => ({
   action: s.action,
-  accelerator: s.displayAccelerator,
+  accelerator: DEFAULT_SCRIPT_SHORTCUTS[s.field],
   description: s.description,
   registered: false
 }));
 
-/** Sends only supported shortcut actions to a visible overlay without focusing or reopening it. */
+/** Sends only supported shortcut actions to a visible, unminimized overlay without focusing or reopening it. */
 export function dispatchShortcutAction(action: ShortcutAction): void {
   if (!VALID_SHORTCUT_ACTIONS.has(action)) return;
-  if (!overlay || overlay.isDestroyed() || !overlay.isVisible()) return;
+  if (!overlay || overlay.isDestroyed() || !overlay.isVisible() || overlay.isMinimized()) return;
   eventLog.push(`shortcut-fire:${action}`);
   overlay.webContents.send('shortcut:action', action);
 }
 
-/** Registers global shortcuts in main and records whether each binding succeeded without falling back. */
+/** Registers global shortcuts in main; Ctrl+Space is active whenever unminimized and Global Script Controls is enabled. */
 export function registerGlobalShortcuts(
   registerFn: (accelerator: string, callback: () => void) => boolean = (acc, cb) => globalShortcut.register(acc, cb)
 ): ShortcutBindingStatus[] {
   globalShortcut.unregisterAll();
-  shortcutStatus = SHORTCUT_SPECS.map((spec) => {
-    const ok = Boolean(registerFn(spec.electronAccelerator, () => dispatchShortcutAction(spec.action)));
-    eventLog.push(`shortcut:${spec.displayAccelerator}:${ok ? 'registered' : 'unavailable'}`);
+  const s = store?.get();
+  const shortcuts = s?.shortcuts ?? DEFAULT_SCRIPT_SHORTCUTS;
+  const globalEnabled = s?.globalScriptControls ?? true;
+  const minimized = Boolean(overlay && !overlay.isDestroyed() && overlay.isMinimized());
+
+  shortcutStatus = SHORTCUT_META.map((meta) => {
+    const displayAccelerator =
+      meta.action === 'toggle-scroll' ? DEFAULT_SCRIPT_SHORTCUTS.toggleScroll : shortcuts[meta.field];
+    const electronAccelerator = toElectronAccelerator(displayAccelerator);
+    const shouldRegister =
+      meta.action === 'toggle-scroll'
+        ? globalEnabled && !minimized
+        : globalEnabled && scriptReaderActive;
+    const ok = shouldRegister
+      ? Boolean(registerFn(electronAccelerator, () => dispatchShortcutAction(meta.action)))
+      : false;
+    eventLog.push(`shortcut:${displayAccelerator}:${ok ? 'registered' : 'unavailable'}`);
     return {
-      action: spec.action,
-      accelerator: spec.displayAccelerator,
-      description: spec.description,
+      action: meta.action,
+      accelerator: displayAccelerator,
+      description: meta.description,
       registered: ok
     };
   });
@@ -83,6 +108,18 @@ export function registerGlobalShortcuts(
     overlay.webContents.send('shortcut:status', shortcutStatus);
   }
   return shortcutStatus;
+}
+
+/** Releases only Ctrl+Space while the window is minimized so other apps can use it. */
+function releaseToggleShortcutOnMinimize(): void {
+  globalShortcut.unregister(toElectronAccelerator(DEFAULT_SCRIPT_SHORTCUTS.toggleScroll));
+  shortcutStatus = shortcutStatus.map((item) =>
+    item.action === 'toggle-scroll' ? { ...item, registered: false } : item
+  );
+  eventLog.push(`shortcut:${DEFAULT_SCRIPT_SHORTCUTS.toggleScroll}:released-on-minimize`);
+  if (overlay && !overlay.isDestroyed()) {
+    overlay.webContents.send('shortcut:status', shortcutStatus);
+  }
 }
 
 /**
@@ -157,6 +194,8 @@ export function createOverlay(): BrowserWindow {
     // Show taskbar entry when minimized so user can restore it
     win.setSkipTaskbar(false);
     applyWindowsTaskbarPreviewProtection(win);
+    releaseToggleShortcutOnMinimize();
+    sttService.stopStream();
     win.webContents.send('window:minimized');
     eventLog.push('minimize-event');
   });
@@ -166,6 +205,7 @@ export function createOverlay(): BrowserWindow {
     win.setSkipTaskbar(true);
     win.setAlwaysOnTop(true, 'screen-saver');
     applyPrivateNotes(win, store.get().privateNotes);
+    registerGlobalShortcuts();
     eventLog.push('restore');
   });
 
@@ -178,7 +218,10 @@ export function createOverlay(): BrowserWindow {
   };
   win.on('move', saveBounds);
   win.on('resize', saveBounds);
-  win.on('closed', () => { if (overlay === win) overlay = null; });
+  win.on('closed', () => {
+    sttService.stopStream();
+    if (overlay === win) overlay = null;
+  });
 
   const devUrl = process.env.VITE_DEV_URL;
   if (!app.isPackaged && devUrl) void win.loadURL(devUrl);
@@ -209,8 +252,12 @@ function registerIpc(): void {
       if ('fontSize' in patch) safe.fontSize = patch.fontSize;
       if ('opacity' in patch) safe.opacity = patch.opacity;
       if ('theme' in patch) safe.theme = patch.theme;
+      if ('globalScriptControls' in patch) safe.globalScriptControls = patch.globalScriptControls === true;
     }
     const next = store.update(safe);
+    if ('globalScriptControls' in safe) {
+      registerGlobalShortcuts();
+    }
     return next;
   });
 
@@ -241,6 +288,97 @@ function registerIpc(): void {
     return shortcutStatus;
   });
 
+  ipcMain.handle('shortcuts:set-reader-active', (e, active: boolean): ShortcutBindingStatus[] => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    const nextActive = active === true;
+    if (scriptReaderActive !== nextActive) {
+      scriptReaderActive = nextActive;
+      registerGlobalShortcuts();
+    }
+    return shortcutStatus;
+  });
+
+  ipcMain.handle(
+    'shortcuts:update-binding',
+    (e, action: ShortcutAction, rawAccelerator: string): ShortcutUpdateResult => {
+      if (!trusted(e)) throw new Error('untrusted sender');
+      const current = store.get();
+      const meta = SHORTCUT_META.find((m) => m.action === action);
+      if (!meta) {
+        return { ok: false, error: 'Unknown shortcut action.', settings: current, status: shortcutStatus };
+      }
+      if (action === 'toggle-scroll') {
+        return {
+          ok: false,
+          error: 'Start / Pause is fixed to Ctrl+Space.',
+          settings: current,
+          status: shortcutStatus
+        };
+      }
+      if (typeof rawAccelerator !== 'string' || containsSpaceKey(rawAccelerator)) {
+        return {
+          ok: false,
+          error: 'Space cannot be used for script controls.',
+          settings: current,
+          status: shortcutStatus
+        };
+      }
+      const normalized = normalizeDisplayBinding(rawAccelerator);
+      if (!normalized) {
+        return {
+          ok: false,
+          error: 'Unsupported key for shortcut.',
+          settings: current,
+          status: shortcutStatus
+        };
+      }
+      const duplicate = SHORTCUT_META.find(
+        (m) => m.action !== action && current.shortcuts[m.field] === normalized
+      );
+      if (duplicate) {
+        return {
+          ok: false,
+          error: `Already assigned to ${duplicate.description}.`,
+          settings: current,
+          status: shortcutStatus
+        };
+      }
+      if (current.shortcuts[meta.field] === normalized) {
+        return { ok: true, settings: current, status: shortcutStatus };
+      }
+
+      // Probe registration with Windows before committing; keep the previous working binding on failure.
+      const electronAcc = toElectronAccelerator(normalized);
+      const wasActive = current.globalScriptControls && scriptReaderActive;
+      const probeOk = globalShortcut.register(electronAcc, () => dispatchShortcutAction(action));
+      if (!probeOk) {
+        if (wasActive) registerGlobalShortcuts();
+        return {
+          ok: false,
+          error: `Shortcut "${normalized}" is unavailable (in use by Windows or another app).`,
+          settings: current,
+          status: shortcutStatus
+        };
+      }
+      globalShortcut.unregister(electronAcc);
+
+      const nextShortcuts: ScriptShortcuts = {
+        ...current.shortcuts,
+        [meta.field]: normalized
+      };
+      const updated = store.update({ shortcuts: nextShortcuts });
+      registerGlobalShortcuts();
+      return { ok: true, settings: updated, status: shortcutStatus };
+    }
+  );
+
+  ipcMain.handle('shortcuts:reset-bindings', (e) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    const updated = store.update({ shortcuts: { ...DEFAULT_SCRIPT_SHORTCUTS } });
+    const status = registerGlobalShortcuts();
+    return { settings: updated, status };
+  });
+
   ipcMain.handle('ai:get-config', (e) => {
     if (!trusted(e)) throw new Error('untrusted sender');
     return aiStore.getPublicConfig();
@@ -251,6 +389,7 @@ function registerIpc(): void {
     const safe: AiConfigPatch = {};
     if (patch && typeof patch === 'object') {
       if (typeof patch.provider === 'string') safe.provider = patch.provider;
+      if (patch.modelMode === 'auto' || patch.modelMode === 'manual') safe.modelMode = patch.modelMode;
       if (typeof patch.model === 'string') safe.model = patch.model;
       if (typeof patch.customBaseUrl === 'string') safe.customBaseUrl = patch.customBaseUrl;
     }
@@ -313,6 +452,8 @@ function registerIpc(): void {
       if (typeof patch.slideSpeech === 'string') safe.slideSpeech = patch.slideSpeech;
       if (typeof patch.researchNotes === 'string') safe.researchNotes = patch.researchNotes;
       if (Array.isArray(patch.approvedPairs)) safe.approvedPairs = patch.approvedPairs;
+      if (typeof patch.answerInstructions === 'string') safe.answerInstructions = patch.answerInstructions;
+      if (Array.isArray(patch.glossary)) safe.glossary = patch.glossary;
     }
     return qaStore.update(safe);
   });
@@ -326,6 +467,9 @@ function registerIpc(): void {
     if (!trusted(e)) throw new Error('untrusted sender');
     const safe: Partial<SttConfig> = {};
     if (patch && typeof patch === 'object') {
+      if (typeof patch.provider === 'string') safe.provider = patch.provider;
+      if (typeof patch.deepgramModel === 'string') safe.deepgramModel = patch.deepgramModel;
+      if (typeof patch.audioSource === 'string') safe.audioSource = patch.audioSource;
       if (typeof patch.language === 'string') safe.language = patch.language;
       if (typeof patch.modelPath === 'string') safe.modelPath = patch.modelPath;
       if (typeof patch.binaryPath === 'string') safe.binaryPath = patch.binaryPath;
@@ -337,6 +481,17 @@ function registerIpc(): void {
     return sttService.updateConfig(safe);
   });
 
+  ipcMain.handle('stt:set-deepgram-key', (e, apiKey: string) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    if (typeof apiKey !== 'string') throw new Error('Invalid Deepgram API key');
+    return sttService.setDeepgramApiKey(apiKey);
+  });
+
+  ipcMain.handle('stt:clear-deepgram-key', (e) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    return sttService.clearDeepgramApiKey();
+  });
+
   ipcMain.handle('stt:get-status', (e) => {
     if (!trusted(e)) throw new Error('untrusted sender');
     return sttService.getStatus();
@@ -346,6 +501,26 @@ function registerIpc(): void {
     if (!trusted(e)) throw new Error('untrusted sender');
     if (typeof pcm16kBase64 !== 'string') throw new Error('Invalid audio payload');
     return sttService.transcribePcm16k(pcm16kBase64, isFinal === true);
+  });
+
+  ipcMain.handle('stt:stream-start', (e) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    return sttService.startStream((ev) => {
+      if (overlay && !overlay.isDestroyed()) {
+        overlay.webContents.send('stt:stream-event', ev);
+      }
+    });
+  });
+
+  ipcMain.on('stt:stream-audio', (e, sessionId: string, pcm16kBase64: string) => {
+    if (!overlay || overlay.isDestroyed() || e.sender !== overlay.webContents) return;
+    if (typeof sessionId !== 'string' || typeof pcm16kBase64 !== 'string') return;
+    sttService.sendStreamAudio(sessionId, pcm16kBase64);
+  });
+
+  ipcMain.handle('stt:stream-stop', (e, sessionId?: string) => {
+    if (!trusted(e)) throw new Error('untrusted sender');
+    sttService.stopStream(typeof sessionId === 'string' ? sessionId : undefined);
   });
 
   ipcMain.handle('ai:stop', (e, requestId?: string) => {
@@ -384,6 +559,20 @@ app.whenReady().then(() => {
   qaStore = new QaKnowledgeStore(userDataDir);
   sttService = new WhisperSttService(userDataDir);
   registerIpc();
+  if (process.platform === 'win32') {
+    session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
+      if (!overlay || overlay.isDestroyed() || request.frame !== overlay.webContents.mainFrame) {
+        callback({});
+        return;
+      }
+      desktopCapturer
+        .getSources({ types: ['screen'] })
+        .then((sources) => {
+          callback(sources[0] ? { video: sources[0], audio: 'loopback' } : {});
+        })
+        .catch(() => callback({}));
+    });
+  }
   const win = createOverlay();
   registerGlobalShortcuts();
   if (SELFTEST) {
@@ -407,6 +596,7 @@ app.on('second-instance', () => {
 
 app.on('before-quit', () => {
   aiProvider.stop();
+  sttService?.stopStream();
   store?.flush();
 });
 app.on('will-quit', () => globalShortcut.unregisterAll());
