@@ -39,13 +39,25 @@ export const STEP_PX = 80;
 type Patch = Partial<Omit<Settings, 'privateNotes'>>;
 type TopTab = 'script' | 'qa';
 
+function formatDurationHms(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
 export function App() {
   const [s, setS] = useState<Settings | null>(null);
   const [activeTab, setActiveTab] = useState<TopTab>('script');
   const [running, setRunning] = useState(false);
+  const [timerRunning, setTimerRunning] = useState(false);
+  const [timerElapsedMs, setTimerElapsedMs] = useState(0);
   const [editing, setEditing] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [shortcuts, setShortcuts] = useState<ShortcutBindingStatus[]>([]);
+  const timerAccumulatedMsRef = useRef(0);
+  const timerStartedAtRef = useRef<number | null>(null);
   const readerRef = useRef<HTMLDivElement>(null);
   const slideBarRef = useRef<HTMLDivElement>(null);
   const slideTrackRef = useRef<HTMLDivElement>(null);
@@ -182,7 +194,7 @@ export function App() {
   const [shortcutError, setShortcutError] = useState<string | null>(null);
   const shortcutsRef = useRef<ShortcutBindingStatus[]>([]);
   const globalControlsRef = useRef(true);
-  const toggleBindingRef = useRef('Enter');
+  const toggleBindingRef = useRef('Ctrl+Space');
   useEffect(() => { shortcutsRef.current = shortcuts; }, [shortcuts]);
   useEffect(() => { if (s) globalControlsRef.current = s.globalScriptControls; }, [s?.globalScriptControls]);
   useEffect(() => { if (s) toggleBindingRef.current = s.shortcuts.toggleScroll; }, [s?.shortcuts?.toggleScroll]);
@@ -324,12 +336,23 @@ export function App() {
     }
   }, [progress.activeIndex]);
 
-  // Scrolling loop: time-based so speed is frame-rate independent; suspended while scrubbing.
-  useEffect(() => {
-    if (!running || editing || scrubbing) return;
+  // Preserve reader scroll position across hidden tab switches without advancing while hidden.
+  useLayoutEffect(() => {
+    if (activeTab !== 'script' || editing) return;
     const el = readerRef.current;
     if (!el) return;
-    posRef.current = el.scrollTop;
+    if (Math.abs(el.scrollTop - posRef.current) > 0.5) {
+      el.scrollTop = posRef.current;
+    }
+    syncProgressOnly(posRef.current);
+  }, [activeTab, editing, syncProgressOnly]);
+
+  // Scrolling loop: time-based so speed is frame-rate independent; suspended while scrubbing or on other tabs.
+  useEffect(() => {
+    if (!running || editing || scrubbing || activeTab !== 'script') return;
+    const el = readerRef.current;
+    if (!el) return;
+    el.scrollTop = posRef.current;
     let last = performance.now();
     let raf = 0;
     const tick = (now: number) => {
@@ -342,7 +365,43 @@ export function App() {
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [running, editing, scrubbing, syncProgressOnly]);
+  }, [running, editing, scrubbing, activeTab, syncProgressOnly]);
+
+  // Independent manual practice stopwatch driven by wall-clock timestamps.
+  useEffect(() => {
+    if (!timerRunning) return;
+    const syncElapsed = () => {
+      if (timerStartedAtRef.current === null) return;
+      const nextMs = timerAccumulatedMsRef.current + Math.max(0, Date.now() - timerStartedAtRef.current);
+      setTimerElapsedMs((prev) => (Math.floor(prev / 1000) === Math.floor(nextMs / 1000) ? prev : nextMs));
+    };
+    syncElapsed();
+    const id = window.setInterval(syncElapsed, 200);
+    return () => window.clearInterval(id);
+  }, [timerRunning]);
+
+  const handleTimerToggle = useCallback(() => {
+    if (timerRunning) {
+      const nextMs =
+        timerStartedAtRef.current !== null
+          ? timerAccumulatedMsRef.current + Math.max(0, Date.now() - timerStartedAtRef.current)
+          : timerAccumulatedMsRef.current;
+      timerAccumulatedMsRef.current = nextMs;
+      timerStartedAtRef.current = null;
+      setTimerElapsedMs(nextMs);
+      setTimerRunning(false);
+      return;
+    }
+    timerStartedAtRef.current = Date.now();
+    setTimerRunning(true);
+  }, [timerRunning]);
+
+  const handleTimerReset = useCallback(() => {
+    timerAccumulatedMsRef.current = 0;
+    timerStartedAtRef.current = null;
+    setTimerRunning(false);
+    setTimerElapsedMs(0);
+  }, []);
 
   const toggleRun = useCallback(() => {
     setEditing(false);
@@ -469,6 +528,7 @@ export function App() {
   }, [seekToClientX, jumpToSlide]);
 
   const onReaderScroll = useCallback(() => {
+    if (activeTabRef.current !== 'script') return;
     const el = readerRef.current;
     if (!el) return;
     if (!runningRef.current) posRef.current = el.scrollTop;
@@ -487,15 +547,15 @@ export function App() {
 
   useEffect(() => {
     return window.teleprompter.onShortcutAction((action: ShortcutAction) => {
+      if (action === 'toggle-scroll') {
+        toggleRun();
+        return;
+      }
       const active = document.activeElement as HTMLElement | null;
       if (active && (['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName) || active.isContentEditable)) {
         return;
       }
-      if (action === 'toggle-scroll') {
-        if (activeTabRef.current === 'script' && !editingRef.current && !settingsOpenRef.current) {
-          toggleRun();
-        }
-      } else if (action === 'step-up') stepScroll(-STEP_PX);
+      if (action === 'step-up') stepScroll(-STEP_PX);
       else if (action === 'step-down') stepScroll(STEP_PX);
     });
   }, [stepScroll, toggleRun]);
@@ -530,8 +590,8 @@ export function App() {
     return () => window.removeEventListener('keydown', onCapture, true);
   }, [capturingAction]);
 
-  // Block Space from scrolling the reader or activating focused script controls,
-  // and handle local Start/Pause when global script controls are off or unregistered.
+  // Block plain Space from scrolling the reader (while preserving Space in text fields and on buttons),
+  // and handle local Ctrl+Space when global registration is off or unavailable.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (capturingAction) return;
@@ -548,27 +608,36 @@ export function App() {
         (['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName) ||
           t.isContentEditable ||
           Boolean(t.closest('[role="combobox"], [role="listbox"], [role="option"]')));
+      const isButton = t instanceof HTMLElement && Boolean(t.closest('button, [role="button"]'));
 
-      if (e.code === 'Space' || e.key === ' ') {
-        if (!inEditable) e.preventDefault();
+      if (
+        (e.code === 'Space' || e.key === ' ') &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        !e.shiftKey &&
+        !e.metaKey
+      ) {
+        if (!inEditable && !isButton) e.preventDefault();
         return;
       }
 
-      if (e.repeat || editingRef.current || activeTabRef.current !== 'script' || settingsOpenRef.current) return;
-      if (inEditable || (t instanceof HTMLElement && (t.tagName === 'BUTTON' || Boolean(t.closest('[data-testid="settings-popover"]'))))) {
-        return;
-      }
+      if (e.repeat) return;
+
+      const isCtrlSpace =
+        e.ctrlKey &&
+        !e.altKey &&
+        !e.shiftKey &&
+        !e.metaKey &&
+        (e.code === 'Space' || e.key === ' ');
+      if (!isCtrlSpace) return;
 
       const globalToggleRegistered =
         globalControlsRef.current &&
         Boolean(shortcutsRef.current.find((item) => item.action === 'toggle-scroll')?.registered);
       if (globalToggleRegistered) return;
 
-      const parsed = keyEventToDisplayBinding(e);
-      if (parsed.binding && parsed.binding === toggleBindingRef.current) {
-        e.preventDefault();
-        toggleRun();
-      }
+      e.preventDefault();
+      toggleRun();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -726,6 +795,8 @@ export function App() {
   const activeFill = slideCount > 0 ? (progress.fills[activeIdx] ?? 0) : 0;
   const playheadPct = slideCount > 0 ? Math.min(100, Math.max(0, ((activeIdx + activeFill) / slideCount) * 100)) : 0;
 
+  const timerToggleLabel = timerRunning ? 'Pause Timer' : timerElapsedMs > 0 ? 'Resume Timer' : 'Start Timer';
+
   return (
     <div className="shell">
       <div
@@ -770,6 +841,34 @@ export function App() {
             </button>
           </div>
           <span className="spacer" />
+          <div
+            className={`top-timer ${timerRunning ? 'running' : timerElapsedMs > 0 ? 'paused' : ''}`}
+            data-testid="top-timer"
+          >
+            <button
+              type="button"
+              className="top-timer-toggle"
+              data-testid="timer-toggle"
+              aria-label={timerToggleLabel}
+              onClick={handleTimerToggle}
+            >
+              {timerRunning ? <PauseIcon /> : <PlayIcon />}
+              <span className="top-timer-label">{timerToggleLabel}</span>
+            </button>
+            <span className="top-timer-clock" data-testid="timer-display" aria-label="Practice timer">
+              {formatDurationHms(timerElapsedMs)}
+            </span>
+            <button
+              type="button"
+              className="top-timer-reset"
+              data-testid="timer-reset"
+              aria-label="Reset Timer"
+              disabled={!timerRunning && timerElapsedMs === 0}
+              onClick={handleTimerReset}
+            >
+              <RestartIcon />
+            </button>
+          </div>
           <button
             type="button"
             className="icon-btn"
@@ -1092,20 +1191,27 @@ export function App() {
             </div>
             {shortcuts.map((item) => {
               const isCapturing = capturingAction === item.action;
+              const isFixedToggle = item.action === 'toggle-scroll';
               return (
                 <div key={item.action} className="shortcut-row" data-testid={`shortcut-${item.action}`}>
                   <span>{item.description}</span>
-                  <button
-                    type="button"
-                    data-testid={`shortcut-bind-${item.action}`}
-                    className={`kbd shortcut-bind-btn ${isCapturing ? 'capturing' : ''}`}
-                    onClick={() => {
-                      setShortcutError(null);
-                      setCapturingAction(isCapturing ? null : item.action);
-                    }}
-                  >
-                    {isCapturing ? 'Press key...' : item.accelerator}
-                  </button>
+                  {isFixedToggle ? (
+                    <span className="kbd" data-testid={`shortcut-bind-${item.action}`}>
+                      {item.accelerator}
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      data-testid={`shortcut-bind-${item.action}`}
+                      className={`kbd shortcut-bind-btn ${isCapturing ? 'capturing' : ''}`}
+                      onClick={() => {
+                        setShortcutError(null);
+                        setCapturingAction(isCapturing ? null : item.action);
+                      }}
+                    >
+                      {isCapturing ? 'Press key...' : item.accelerator}
+                    </button>
+                  )}
                 </div>
               );
             })}
@@ -1114,9 +1220,15 @@ export function App() {
                 {shortcutError}
               </div>
             )}
-            {s.globalScriptControls && s.shortcuts.toggleScroll === 'Enter' && (
+            {s.globalScriptControls &&
+              shortcuts.some((item) => item.action === 'toggle-scroll' && !item.registered) && (
+                <div className="shortcut-error" data-testid="shortcut-unavailable-note" role="status">
+                  Ctrl+Space is unavailable globally (already in use by another app). Use the Start / Pause button or press Ctrl+Space while focused.
+                </div>
+              )}
+            {s.globalScriptControls && (
               <div className="shortcut-note" data-testid="shortcut-global-note">
-                Enter is global on the Script reader and released in Settings, Edit, and Q&amp;A.
+                Ctrl+Space works globally while open and unminimised, and is released when minimised or quit.
               </div>
             )}
           </div>

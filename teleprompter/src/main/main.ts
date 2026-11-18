@@ -67,26 +67,32 @@ let shortcutStatus: ShortcutBindingStatus[] = SHORTCUT_META.map((s) => ({
   registered: false
 }));
 
-/** Sends only supported shortcut actions to a visible overlay without focusing or reopening it. */
+/** Sends only supported shortcut actions to a visible, unminimized overlay without focusing or reopening it. */
 export function dispatchShortcutAction(action: ShortcutAction): void {
   if (!VALID_SHORTCUT_ACTIONS.has(action)) return;
-  if (!overlay || overlay.isDestroyed() || !overlay.isVisible()) return;
+  if (!overlay || overlay.isDestroyed() || !overlay.isVisible() || overlay.isMinimized()) return;
   eventLog.push(`shortcut-fire:${action}`);
   overlay.webContents.send('shortcut:action', action);
 }
 
-/** Registers global shortcuts in main when Global Script Controls and the Script reader are active. */
+/** Registers global shortcuts in main; Ctrl+Space is active whenever unminimized and Global Script Controls is enabled. */
 export function registerGlobalShortcuts(
   registerFn: (accelerator: string, callback: () => void) => boolean = (acc, cb) => globalShortcut.register(acc, cb)
 ): ShortcutBindingStatus[] {
   globalShortcut.unregisterAll();
   const s = store?.get();
   const shortcuts = s?.shortcuts ?? DEFAULT_SCRIPT_SHORTCUTS;
-  const shouldRegister = (s?.globalScriptControls ?? true) && scriptReaderActive;
+  const globalEnabled = s?.globalScriptControls ?? true;
+  const minimized = Boolean(overlay && !overlay.isDestroyed() && overlay.isMinimized());
 
   shortcutStatus = SHORTCUT_META.map((meta) => {
-    const displayAccelerator = shortcuts[meta.field];
+    const displayAccelerator =
+      meta.action === 'toggle-scroll' ? DEFAULT_SCRIPT_SHORTCUTS.toggleScroll : shortcuts[meta.field];
     const electronAccelerator = toElectronAccelerator(displayAccelerator);
+    const shouldRegister =
+      meta.action === 'toggle-scroll'
+        ? globalEnabled && !minimized
+        : globalEnabled && scriptReaderActive;
     const ok = shouldRegister
       ? Boolean(registerFn(electronAccelerator, () => dispatchShortcutAction(meta.action)))
       : false;
@@ -102,6 +108,18 @@ export function registerGlobalShortcuts(
     overlay.webContents.send('shortcut:status', shortcutStatus);
   }
   return shortcutStatus;
+}
+
+/** Releases only Ctrl+Space while the window is minimized so other apps can use it. */
+function releaseToggleShortcutOnMinimize(): void {
+  globalShortcut.unregister(toElectronAccelerator(DEFAULT_SCRIPT_SHORTCUTS.toggleScroll));
+  shortcutStatus = shortcutStatus.map((item) =>
+    item.action === 'toggle-scroll' ? { ...item, registered: false } : item
+  );
+  eventLog.push(`shortcut:${DEFAULT_SCRIPT_SHORTCUTS.toggleScroll}:released-on-minimize`);
+  if (overlay && !overlay.isDestroyed()) {
+    overlay.webContents.send('shortcut:status', shortcutStatus);
+  }
 }
 
 /**
@@ -176,6 +194,7 @@ export function createOverlay(): BrowserWindow {
     // Show taskbar entry when minimized so user can restore it
     win.setSkipTaskbar(false);
     applyWindowsTaskbarPreviewProtection(win);
+    releaseToggleShortcutOnMinimize();
     sttService.stopStream();
     win.webContents.send('window:minimized');
     eventLog.push('minimize-event');
@@ -186,6 +205,7 @@ export function createOverlay(): BrowserWindow {
     win.setSkipTaskbar(true);
     win.setAlwaysOnTop(true, 'screen-saver');
     applyPrivateNotes(win, store.get().privateNotes);
+    registerGlobalShortcuts();
     eventLog.push('restore');
   });
 
@@ -286,6 +306,14 @@ function registerIpc(): void {
       const meta = SHORTCUT_META.find((m) => m.action === action);
       if (!meta) {
         return { ok: false, error: 'Unknown shortcut action.', settings: current, status: shortcutStatus };
+      }
+      if (action === 'toggle-scroll') {
+        return {
+          ok: false,
+          error: 'Start / Pause is fixed to Ctrl+Space.',
+          settings: current,
+          status: shortcutStatus
+        };
       }
       if (typeof rawAccelerator !== 'string' || containsSpaceKey(rawAccelerator)) {
         return {

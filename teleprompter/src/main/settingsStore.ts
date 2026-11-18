@@ -21,11 +21,15 @@ const clamp = (n: unknown, min: number, max: number, fallback: number): number =
   typeof n === 'number' && Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
 
 function sanitizeShortcuts(raw: Partial<ScriptShortcuts> | undefined, base: ScriptShortcuts): ScriptShortcuts {
-  const toggleScroll = normalizeDisplayBinding(raw?.toggleScroll) ?? base.toggleScroll;
-  const stepUp = normalizeDisplayBinding(raw?.stepUp) ?? base.stepUp;
-  const stepDown = normalizeDisplayBinding(raw?.stepDown) ?? base.stepDown;
+  // Start / Pause is fixed to Ctrl+Space; migrate any legacy Enter/custom toggleScroll binding.
+  const toggleScroll = DEFAULT_SCRIPT_SHORTCUTS.toggleScroll;
+  let stepUp = normalizeDisplayBinding(raw?.stepUp) ?? base.stepUp;
+  let stepDown = normalizeDisplayBinding(raw?.stepDown) ?? base.stepDown;
 
-  // Ensure uniqueness; fall back to defaults if a corrupted file creates duplicates.
+  if (stepUp === toggleScroll) stepUp = DEFAULT_SCRIPT_SHORTCUTS.stepUp;
+  if (stepDown === toggleScroll || stepDown === stepUp) {
+    stepDown = DEFAULT_SCRIPT_SHORTCUTS.stepDown;
+  }
   if (new Set([toggleScroll, stepUp, stepDown]).size !== 3) {
     return { ...DEFAULT_SCRIPT_SHORTCUTS };
   }

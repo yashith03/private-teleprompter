@@ -1,7 +1,7 @@
 import type { ScriptShortcuts } from './types';
 
 export const DEFAULT_SCRIPT_SHORTCUTS: ScriptShortcuts = {
-  toggleScroll: 'Enter',
+  toggleScroll: 'Ctrl+Space',
   stepUp: 'Ctrl+Up',
   stepDown: 'Ctrl+Down'
 };
@@ -31,7 +31,7 @@ function normalizeMainKey(part: string): string | null {
   const trimmed = part.trim();
   if (!trimmed) return null;
   const low = trimmed.toLowerCase();
-  if (low === 'space' || low === 'spacebar' || trimmed === ' ') return null;
+  if (low === 'space' || low === 'spacebar' || trimmed === ' ') return 'Space';
   if (low === 'esc' || low === 'escape') return null;
   if (low === 'return' || low === 'enter' || low === 'numpadenter') return 'Enter';
   if (low === 'arrowup' || low === 'up') return 'Up';
@@ -83,6 +83,7 @@ export function normalizeDisplayBinding(raw: unknown): string | null {
 
   if (!mainKey) return null;
   const orderedMods = MODIFIER_ORDER.filter((m) => mods.has(m));
+  if (mainKey === 'Space' && orderedMods.length === 0) return null;
   return [...orderedMods, mainKey].join('+');
 }
 
@@ -108,14 +109,17 @@ export function keyEventToDisplayBinding(e: {
     return { cancel: true };
   }
   if (e.code === 'Space' || e.key === ' ') {
-    return { error: 'Space cannot be used for script controls.' };
+    if (!e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey) {
+      return { error: 'Space cannot be used for script controls.' };
+    }
   }
   if (['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)) {
     return { ignore: true };
   }
 
   let rawKey = e.key;
-  if (e.code === 'Enter' || e.code === 'NumpadEnter') rawKey = 'Enter';
+  if (e.code === 'Space' || e.key === ' ') rawKey = 'Space';
+  else if (e.code === 'Enter' || e.code === 'NumpadEnter') rawKey = 'Enter';
   else if (e.code.startsWith('Key') && e.code.length === 4) rawKey = e.code.slice(3);
   else if (e.code.startsWith('Digit') && e.code.length === 6) rawKey = e.code.slice(5);
 

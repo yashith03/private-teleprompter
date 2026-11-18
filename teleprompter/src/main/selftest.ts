@@ -173,19 +173,20 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
     check('resume continues from paused position', r1 > p2 + 50, `${p2} -> ${r1}`);
     await click(win, 'toggle');
 
-    // Global shortcut registration & Alt/Ctrl+Space-removal checks.
+    // Global shortcut registration: Ctrl+Space (Start / Pause), Ctrl+Up, Ctrl+Down.
     const bindings = await js<ShortcutBindingStatus[]>(win, `window.teleprompter.getShortcuts()`);
-    check('shortcuts: 3 global bindings exposed (Enter,Ctrl+Up,Ctrl+Down)',
+    check('shortcuts: 3 global bindings exposed (Ctrl+Space,Ctrl+Up,Ctrl+Down)',
       bindings.length === 3 &&
-      bindings.map((b) => b.accelerator).join(',') === 'Enter,Ctrl+Up,Ctrl+Down' &&
+      bindings.map((b) => b.accelerator).join(',') === 'Ctrl+Space,Ctrl+Up,Ctrl+Down' &&
       bindings.every((b) => b.registered),
       JSON.stringify(bindings.map((b) => `${b.accelerator}:${b.registered}`)));
-    check('shortcuts: old Ctrl+Space and Ctrl+Alt+Up/Down not registered',
-      !globalShortcut.isRegistered('Control+Space') &&
+    check('shortcuts: Return and old Ctrl+Alt+Up/Down not registered',
+      globalShortcut.isRegistered('Control+Space') &&
+      !globalShortcut.isRegistered('Return') &&
       !globalShortcut.isRegistered('Control+Alt+Up') &&
       !globalShortcut.isRegistered('Control+Alt+Down'));
 
-    // Global toggle-scroll (Enter) starts, pauses without reset, and resumes without stealing focus.
+    // Global toggle-scroll (Ctrl+Space) starts, pauses without reset, and resumes without stealing focus.
     await click(win, 'restart');
     await sleep(100);
     const focusApp = new BrowserWindow({ width: 160, height: 120, show: true });
@@ -206,27 +207,82 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
     ctx.dispatchShortcutAction('toggle-scroll'); // pause
     await sleep(100);
     focusApp.destroy();
-    check('Global Enter (toggle-scroll) starts, pauses, and resumes without focus',
+    check('Global Ctrl+Space (toggle-scroll) starts, pauses, and resumes without focus',
       unfocusedForToggle && stillUnfocused1 && gs1 > 30 && gp1 > 30 && Math.abs(gp2 - gp1) < 2 && gr1 > gp2 + 30,
       `unfocused=${unfocusedForToggle}/${stillUnfocused1} gs1=${gs1} gp=${gp1}->${gp2} gr1=${gr1}`);
 
-    // Turning Global Script Controls OFF unregisters global keys and keeps local Enter working.
+    // Inactive tab (AI Q&A): Ctrl+Space stays registered, toggles running state without scrolling/resetting hidden reader, and resumes from preserved position.
+    const posBeforeTabSwitch = await scrollTop(win);
+    await click(win, 'tab-qa');
+    await sleep(100);
+    const ctrlSpaceOnQa = globalShortcut.isRegistered('Control+Space');
+    ctx.dispatchShortcutAction('toggle-scroll'); // start while on AI Q&A
+    await sleep(450);
+    const toggleLabelOnQa = await js<string>(win, `document.querySelector('[data-testid="toggle"]').textContent`);
+    await click(win, 'tab-script');
+    await sleep(60);
+    const posRightAfterReturn = await scrollTop(win);
+    await sleep(450);
+    const posAfterResumedOnScript = await scrollTop(win);
+    ctx.dispatchShortcutAction('toggle-scroll'); // pause
+    await sleep(80);
+    check('Ctrl+Space works on AI Q&A tab without advancing hidden reader and resumes from preserved position',
+      ctrlSpaceOnQa &&
+      /Pause/.test(toggleLabelOnQa) &&
+      posRightAfterReturn >= posBeforeTabSwitch - 2 &&
+      posAfterResumedOnScript > posBeforeTabSwitch + 20,
+      JSON.stringify({ ctrlSpaceOnQa, toggleLabelOnQa, posBeforeTabSwitch, posRightAfterReturn, posAfterResumedOnScript }));
+
+    // Minimize releases ONLY Ctrl+Space (leaving Ctrl+Up registered); restore re-registers it without clicking Script tab.
+    win.minimize();
+    await sleep(200);
+    const minReleasedCtrlSpace = !globalShortcut.isRegistered('Control+Space');
+    const minKeptStep = globalShortcut.isRegistered('Control+Up');
+    win.restore();
+    await sleep(200);
+    await click(win, 'tab-qa');
+    await sleep(80);
+    win.minimize();
+    await sleep(200);
+    win.restore();
+    await sleep(250);
+    const restoredCtrlSpaceOnQa = globalShortcut.isRegistered('Control+Space');
+    await click(win, 'tab-script');
+    await sleep(80);
+    check('Minimize releases only Ctrl+Space and restore re-registers it without clicking Script',
+      minReleasedCtrlSpace && minKeptStep && restoredCtrlSpaceOnQa,
+      JSON.stringify({ minReleasedCtrlSpace, minKeptStep, restoredCtrlSpaceOnQa }));
+
+    // Turning Global Script Controls OFF unregisters global keys and local Ctrl+Space handles hold (1 toggle) vs two quick taps (2 toggles).
     await js(win, `window.teleprompter.updateSettings({ globalScriptControls: false })`);
     await sleep(150);
-    const unregisteredWhenOff = !globalShortcut.isRegistered('Return') && !globalShortcut.isRegistered('Control+Up');
+    const unregisteredWhenOff = !globalShortcut.isRegistered('Control+Space') && !globalShortcut.isRegistered('Control+Up');
     await click(win, 'restart');
     await sleep(100);
-    await js(win, `window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }))`);
-    await sleep(600);
-    const localEnterStarted = (await scrollTop(win)) > 20;
-    await js(win, `window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'NumpadEnter', bubbles: true }))`);
-    await sleep(100);
+    // Hold Ctrl+Space: initial keydown + repeated keydowns -> toggles ONCE (Start -> Pause)
+    await js(win, `(() => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', ctrlKey: true, repeat: false, bubbles: true }));
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', ctrlKey: true, repeat: true, bubbles: true }));
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', ctrlKey: true, repeat: true, bubbles: true }));
+    })()`);
+    await sleep(50);
+    const labelAfterHold = await js<string>(win, `document.querySelector('[data-testid="toggle"]').textContent`);
+    // Two separate quick taps (repeat: false) -> toggles TWICE (Pause -> Start -> Pause)
+    await js(win, `window.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', ctrlKey: true, repeat: false, bubbles: true }))`);
+    await sleep(30);
+    const labelAfterTap1 = await js<string>(win, `document.querySelector('[data-testid="toggle"]').textContent`);
+    await js(win, `window.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', ctrlKey: true, repeat: false, bubbles: true }))`);
+    await sleep(30);
+    const labelAfterTap2 = await js<string>(win, `document.querySelector('[data-testid="toggle"]').textContent`);
+    // Pause before subsequent step tests
+    await click(win, 'toggle');
+    await sleep(80);
     await js(win, `window.teleprompter.updateSettings({ globalScriptControls: true })`);
     await sleep(150);
-    const reRegisteredWhenOn = globalShortcut.isRegistered('Return');
-    check('Global Script Controls OFF releases global keys and keeps local Enter working',
-      unregisteredWhenOff && localEnterStarted && reRegisteredWhenOn,
-      JSON.stringify({ unregisteredWhenOff, localEnterStarted, reRegisteredWhenOn }));
+    const reRegisteredWhenOn = globalShortcut.isRegistered('Control+Space');
+    check('Global Script Controls OFF releases global keys; local Ctrl+Space hold toggles once and two quick taps toggle twice',
+      unregisteredWhenOff && /Pause/.test(labelAfterHold) && /Start/.test(labelAfterTap1) && /Pause/.test(labelAfterTap2) && reRegisteredWhenOn,
+      JSON.stringify({ unregisteredWhenOff, labelAfterHold, labelAfterTap1, labelAfterTap2, reRegisteredWhenOn }));
 
     // Ctrl+Up / Ctrl+Down still work when another app is focused without stealing focus.
     const otherApp = new BrowserWindow({ width: 160, height: 120, show: true });
@@ -285,9 +341,13 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
     check('Ctrl+Down preserves playing state',
       playingStepped > 260 && /Pause/.test(togglePlaying), `scrollTop=${playingStepped} label=${togglePlaying}`);
 
-    // Space does not toggle playback; editor Enter and Settings Enter do not toggle playback.
+    // Plain Space, Enter, and Alt do not toggle playback; editor Enter and Settings Enter do not toggle playback.
     const beforeSpaceKey = await scrollTop(win);
-    await js(win, `window.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', bubbles: true }))`);
+    await js(win, `(() => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', bubbles: true }));
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt', code: 'AltLeft', altKey: true, bubbles: true }));
+    })()`);
     await sleep(120);
     const afterSpaceKey = await scrollTop(win);
     const labelAfterSpace = await js<string>(win, `document.querySelector('[data-testid="toggle"]').textContent`);
@@ -306,26 +366,29 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
     const labelAfterSettingsEnter = await js<string>(win, `document.querySelector('[data-testid="toggle"]').textContent`);
     await click(win, 'settings');
     await sleep(80);
-    check('Space, editor Enter, and Settings Enter do not hijack playback',
+    check('Plain Space, Enter, and Alt do not hijack playback',
       /Start/.test(labelAfterSpace) && Math.abs(afterSpaceKey - beforeSpaceKey) < 2 &&
       stillEditing && /Start/.test(labelAfterEditorEnter) && /Start/.test(labelAfterSettingsEnter),
       `space=${beforeSpaceKey}->${afterSpaceKey} editing=${stillEditing} editorLabel=${labelAfterEditorEnter} settingsLabel=${labelAfterSettingsEnter}`);
 
-    // Registration failure handling: toolbar Start button still works; customizable shortcuts reject Space/duplicates, persist, and reset.
+    // Registration failure handling: toolbar Start button still works; toggle-scroll is fixed to Ctrl+Space; step shortcuts reject Space/duplicates, persist, and reset.
     const shortcutCust = await js<{
+      toggleFixed: boolean;
       spaceRejected: boolean;
       dupRejected: boolean;
       f8Ok: boolean;
       hasButtonTitle: boolean;
       list: string;
     }>(win, `(async () => {
-      const spaceRes = await window.teleprompter.updateShortcutBinding('toggle-scroll', 'Space');
-      const dupRes = await window.teleprompter.updateShortcutBinding('toggle-scroll', 'Ctrl+Up');
-      const f8Res = await window.teleprompter.updateShortcutBinding('toggle-scroll', 'F8');
+      const toggleRes = await window.teleprompter.updateShortcutBinding('toggle-scroll', 'Enter');
+      const spaceRes = await window.teleprompter.updateShortcutBinding('step-up', 'Space');
+      const dupRes = await window.teleprompter.updateShortcutBinding('step-up', 'Ctrl+Down');
+      const f8Res = await window.teleprompter.updateShortcutBinding('step-up', 'F8');
       return {
+        toggleFixed: !toggleRes.ok && toggleRes.settings.shortcuts.toggleScroll === 'Ctrl+Space',
         spaceRejected: !spaceRes.ok && /Space/i.test(spaceRes.error || ''),
         dupRejected: !dupRes.ok && /Already assigned/i.test(dupRes.error || ''),
-        f8Ok: f8Res.ok && f8Res.settings.shortcuts.toggleScroll === 'F8',
+        f8Ok: f8Res.ok && f8Res.settings.shortcuts.stepUp === 'F8',
         hasButtonTitle: [...document.querySelectorAll('button[title]')].length > 0,
         list: document.querySelector('[data-testid="shortcuts-list"]').textContent
       };
@@ -337,14 +400,15 @@ export async function runSelfTest(ctx: Ctx): Promise<void> {
     await js(win, `window.teleprompter.resetShortcutBindings()`);
     await sleep(100);
     const afterReset = await js<ShortcutBindingStatus[]>(win, `window.teleprompter.getShortcuts()`);
-    check('customizable shortcuts reject Space/duplicates, update to F8, reset to defaults, and buttons have no title tooltips',
+    check('toggle-scroll fixed to Ctrl+Space, step shortcuts reject Space/duplicates, update to F8, reset to defaults, and buttons have no title tooltips',
+      shortcutCust.toggleFixed &&
       shortcutCust.spaceRejected &&
       shortcutCust.dupRejected &&
       shortcutCust.f8Ok &&
       !shortcutCust.hasButtonTitle &&
       !/Alt/i.test(shortcutCust.list) &&
       uiBtnStillWorks &&
-      afterReset.map((b) => b.accelerator).join(',') === 'Enter,Ctrl+Up,Ctrl+Down',
+      afterReset.map((b) => b.accelerator).join(',') === 'Ctrl+Space,Ctrl+Up,Ctrl+Down',
       JSON.stringify({ shortcutCust, afterReset: afterReset.map((b) => b.accelerator) }));
 
     // Smallest supported window: nothing clipped or wrapped awkwardly.

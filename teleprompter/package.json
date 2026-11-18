@@ -75,7 +75,7 @@
       "artifactName": "Private-Teleprompter-Setup-${version}.exe",
       "oneClick": true,
       "perMachine": false,
-      "createDesktopShortcut": true,
+      "createDesktopShortcut": "always",
       "createStartMenuShortcut": true,
       "shortcutName": "Private Teleprompter",
       "installerIcon": "build/icon.ico",
