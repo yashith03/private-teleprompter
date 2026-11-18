@@ -4,12 +4,6 @@ An offline-first **Windows 11 teleprompter overlay & AI Q&A assistant** built wi
 
 ---
 
-## 🎬 Demo Video
-
-👉 **[Watch `private-teleprompter.mp4`](./private-teleprompter.mp4)** *(click **View raw** on GitHub to play/download the 7 MB MP4)*
-
----
-
 ## 📦 Installation (Windows 11) & Microsoft Defender Instructions
 
 Download from the `release/` folder or GitHub Releases:
